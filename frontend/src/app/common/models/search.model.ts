@@ -37,7 +37,9 @@ export type ImagenRequest = {
    * model's own default. Imagen and Gemini Omni do not accept it.
    */
   temperature?: number;
-  resolution?: '1K' | '2K' | '4K';
+  resolution?: '512' | '1K' | '2K' | '4K';
+  referenceVideo?: AssetReferenceDto;
+  externalUrl?: string | null;
 };
 
 export type SourceMediaItemLink = {
@@ -62,6 +64,17 @@ export interface AssetReferenceDto {
   id: number;
   type: 'source_asset' | 'media_item';
   index?: number;
+}
+
+export interface ConditioningFrameDto {
+  frame_number: number;
+  image_asset_id: AssetReferenceDto;
+}
+
+export interface KeyframeSlot {
+  frameNumber: number;
+  previewUrl: string;
+  assetId: AssetReferenceDto;
 }
 
 export type VeoRequest = {
@@ -101,6 +114,11 @@ export type VeoRequest = {
    */
   stripSourceAudio?: boolean;
   resolution?: '1K' | '2K' | '4K' | '360p' | '720p' | '1080p';
+  videoTransformStrength?: number;
+  numDiffusionSteps?: number;
+  seed?: number;
+  videoTransformMaskAssetId?: AssetReferenceDto | null;
+  conditioningFrames?: ConditioningFrameDto[] | null;
 };
 
 export type SearchResponse = {
@@ -146,6 +164,7 @@ export interface GallerySearchDto {
   status?: string;
   workspaceId?: number;
   includeDeleted?: boolean;
+  includeExternal?: boolean;
   startDate?: string;
   endDate?: string;
   itemType?: string;
@@ -168,6 +187,7 @@ export interface ReferenceVideo {
   id: number;
   type: 'source_asset' | 'media_item';
   previewUrl: string;
+  videoUrl?: string;
   index?: number;
 }
 

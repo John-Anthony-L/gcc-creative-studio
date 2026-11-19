@@ -22,7 +22,13 @@ import {
   ReferenceVideo,
   ReferenceAudio,
 } from '../common/models/search.model';
-import {MODEL_CONFIGS} from '../common/config/model-config';
+import {
+  getSupportedModelDurations,
+  MODEL_CONFIGS,
+} from '../common/config/model-config';
+
+export const DEFAULT_OMNI_MODEL = 'gemini-omni-1.2-flash';
+export const DEFAULT_VIDEO_MODEL = DEFAULT_OMNI_MODEL;
 
 const STORAGE_KEY = 'video_state';
 
@@ -49,7 +55,12 @@ interface VideoState {
   referenceAudio: ReferenceAudio | null;
   /** The clip being modified in Edit Video mode. */
   editSource: ReferenceVideo | null;
+  /** Optional inpainting mask video for localized edits. */
+  maskSource?: ReferenceVideo | null;
   stripSourceAudio: boolean;
+  transformStrength?: number;
+  seed?: number | null;
+  numDiffusionSteps?: number;
 }
 
 @Injectable({
@@ -65,7 +76,7 @@ export class VideoStateService {
       prompt: '',
       aspectRatio: '16:9',
       resolution: '1K',
-      model: 'gemini-omni-1.1-flash-preview',
+      model: DEFAULT_VIDEO_MODEL,
       style: null,
       colorAndTone: null,
       lighting: null,
@@ -83,7 +94,11 @@ export class VideoStateService {
       referenceVideos: [],
       referenceAudio: null,
       editSource: null,
+      maskSource: null,
       stripSourceAudio: true,
+      transformStrength: 0.5,
+      seed: null,
+      numDiffusionSteps: 20,
     };
 
     let savedState: VideoState | null = null;
@@ -134,20 +149,49 @@ export class VideoStateService {
                 : supportedModes[0];
             }
 
+            const restoredReferenceImages = (
+              parsed.referenceImages ?? []
+            ).filter(
+              (ref: ReferenceImage) =>
+                !!ref && (!!ref.sourceAssetId || !!ref.sourceMediaItem),
+            );
+
+            const loadedResolution =
+              parsed.resolution ?? this.initialState.resolution;
+            let loadedDuration =
+              parsed.durationSeconds ?? this.initialState.durationSeconds;
+            const supportedDurations = getSupportedModelDurations(
+              activeConfig,
+              loadedMode,
+              loadedResolution,
+              false,
+              restoredReferenceImages.length > 0,
+            );
+            if (
+              supportedDurations.length > 0 &&
+              !supportedDurations.includes(loadedDuration)
+            ) {
+              const clamped = Math.min(
+                loadedDuration,
+                supportedDurations[supportedDurations.length - 1],
+              );
+              loadedDuration = supportedDurations.includes(clamped)
+                ? clamped
+                : supportedDurations[supportedDurations.length - 1];
+            }
+
             savedState = {
               ...this.initialState,
               ...parsed,
               model: loadedModel,
               mode: loadedMode,
               numberOfMedia: loadedNumMedia,
+              durationSeconds: loadedDuration,
               // Restore what the user had attached, keeping only entries that
               // still carry a usable server-side reference. A corrupt or
               // half-written entry would otherwise be sent to the backend and
               // rejected.
-              referenceImages: (parsed.referenceImages ?? []).filter(
-                (ref: ReferenceImage) =>
-                  !!ref && (!!ref.sourceAssetId || !!ref.sourceMediaItem),
-              ),
+              referenceImages: restoredReferenceImages,
               referenceVideo: parsed.referenceVideo?.id
                 ? parsed.referenceVideo
                 : null,
@@ -159,6 +203,13 @@ export class VideoStateService {
                 ? parsed.referenceAudio
                 : null,
               editSource: loadedEditSource,
+              maskSource:
+                activeConfig?.capabilities.supportsMask && parsed.maskSource?.id
+                  ? parsed.maskSource
+                  : null,
+              transformStrength: parsed.transformStrength ?? 0.5,
+              seed: parsed.seed ?? null,
+              numDiffusionSteps: parsed.numDiffusionSteps ?? 20,
             };
           }
         }
@@ -203,6 +254,8 @@ export class VideoStateService {
     this.state.next({
       ...this.initialState,
       referenceImages: [],
+      referenceVideos: [],
+      maskSource: null,
     });
     if (typeof localStorage !== 'undefined') {
       try {

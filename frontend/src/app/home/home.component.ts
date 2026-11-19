@@ -46,8 +46,10 @@ import {
 } from '../common/config/model-config';
 import {MediaItem} from '../common/models/media-item.model';
 import {
+  AssetReferenceDto,
   ImagenRequest,
   ReferenceImage,
+  ReferenceVideo,
   SourceMediaItemLink,
 } from '../common/models/search.model';
 import {
@@ -67,6 +69,8 @@ import {
   handleInfoSnackbar,
   handleSuccessSnackbar,
 } from '../utils/handleMessageSnackbar';
+import {YouTubeInputComponent} from '../common/components/youtube-input-dialog/youtube-input-dialog.component';
+import {extractYouTubeVideoId} from '../utils/youtube.utils';
 
 @Component({
   selector: 'app-home',
@@ -83,6 +87,8 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
   referenceImages: ReferenceImage[] = [];
   sourceMediaItems: (SourceMediaItemLink | null)[] = [];
   activeWorkspaceId$: Observable<number | null>;
+  referenceVideo: ReferenceVideo | null = null;
+  externalUrl: string | null = null;
 
   @HostListener('window:keydown.control.enter', ['$event'])
   handleCtrlEnter(event: Event) {
@@ -119,6 +125,11 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
       icon: 'layers',
       label: 'Ingredients to Image',
     },
+    {
+      value: 'Video to Image',
+      icon: 'movie',
+      label: 'Video to Image',
+    },
   ];
   currentMode = 'Text to Image';
 
@@ -140,6 +151,12 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
     disabled: boolean;
     icon: string;
   }[] = [
+    {
+      value: 'auto',
+      viewValue: 'Auto \n Dynamic',
+      disabled: true,
+      icon: 'hdr_auto',
+    },
     {
       value: '1:1',
       viewValue: '1:1 \n Square',
@@ -225,7 +242,9 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
       icon: 'crop_16_9',
     },
   ];
-  selectedAspectRatio = this.aspectRatioOptions[0].viewValue;
+  selectedAspectRatio =
+    this.aspectRatioOptions.find(r => r.value === '1:1')?.viewValue ||
+    this.aspectRatioOptions[0].viewValue;
   imageStyles = [
     'Cinematic',
     'Fantasy',
@@ -418,7 +437,11 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
       this.searchRequest.numberOfMedia = state.numberOfMedia;
       this.searchRequest.composition = state.composition;
       this.searchRequest.useBrandGuidelines = state.useBrandGuidelines;
-      this.searchRequest.enhancePrompt = state.enhancePrompt;
+      if (state.enhancePrompt !== undefined) {
+        this.searchRequest.enhancePrompt = state.enhancePrompt;
+      } else {
+        delete this.searchRequest.enhancePrompt;
+      }
       this.currentMode = state.mode;
 
       // Update local variables to reflect state
@@ -429,6 +452,21 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
         this.generationModels.find(m => m.value === state.model) ||
         this.generationModels[0];
 
+      const allowsAuto =
+        (this.currentMode === 'Ingredients to Image' ||
+          this.currentMode === 'Video to Image') &&
+        this.selectedGenerationModelObject.value.startsWith('gemini-');
+      this.aspectRatioOptions.forEach(r => {
+        if (r.value === 'auto') {
+          r.disabled = !allowsAuto;
+        } else {
+          r.disabled =
+            !this.selectedGenerationModelObject.capabilities.supportedAspectRatios.includes(
+              r.value,
+            );
+        }
+      });
+
       this.selectedAspectRatio =
         this.aspectRatioOptions.find(r => r.value === state.aspectRatio)
           ?.viewValue || '1:1 \n Square';
@@ -437,6 +475,8 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
         this.watermarkOptions.find(o => o.value === state.watermark)
           ?.viewValue || 'No';
       this.service.imagePrompt = state.prompt;
+      this.referenceVideo = state.referenceVideo ?? null;
+      this.externalUrl = state.externalUrl ?? null;
     });
   }
 
@@ -457,6 +497,8 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
       useBrandGuidelines: this.searchRequest.useBrandGuidelines,
       enhancePrompt: this.searchRequest.enhancePrompt || false,
       mode: this.currentMode,
+      referenceVideo: this.referenceVideo,
+      externalUrl: this.externalUrl,
     });
   }
 
@@ -513,23 +555,65 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  private isAutoAspectRatioSupportedMode(mode: string): boolean {
+    return mode === 'Ingredients to Image' || mode === 'Video to Image';
+  }
+
   private applyModelSettings(model: GenerationModelConfig) {
     const capabilities = model.capabilities;
 
-    // Enable/Disable aspect ratios based on capabilities
+    // Enable/Disable aspect ratios based on capabilities and mode
     this.aspectRatioOptions.forEach(r => {
-      r.disabled = !capabilities.supportedAspectRatios.includes(r.value);
+      if (r.value === 'auto') {
+        r.disabled =
+          !this.isAutoAspectRatioSupportedMode(this.currentMode) ||
+          !model.value.startsWith('gemini-');
+      } else {
+        r.disabled = !capabilities.supportedAspectRatios.includes(r.value);
+      }
     });
 
-    // If current aspect ratio is not supported, switch to the first supported one (usually 1:1)
-    if (
-      !capabilities.supportedAspectRatios.includes(
-        this.searchRequest.aspectRatio,
+    // If current aspect ratio is not supported or disabled, switch to the first supported one
+    const currentOption = this.aspectRatioOptions.find(
+      r => r.value === this.searchRequest.aspectRatio,
+    );
+    if (!currentOption || currentOption.disabled) {
+      const defaultOption = this.isAutoAspectRatioSupportedMode(
+        this.currentMode,
       )
-    ) {
-      const firstSupported = this.aspectRatioOptions.find(r => !r.disabled);
+        ? this.aspectRatioOptions.find(r => r.value === 'auto' && !r.disabled)
+        : this.aspectRatioOptions.find(r => r.value === '1:1' && !r.disabled);
+      const firstSupported =
+        defaultOption || this.aspectRatioOptions.find(r => !r.disabled);
       if (firstSupported) {
         this.selectAspectRatio(firstSupported);
+      }
+    }
+  }
+
+  private updateAspectRatioForMode(previousMode: string, newMode: string) {
+    if (this.selectedGenerationModelObject) {
+      this.applyModelSettings(this.selectedGenerationModelObject);
+    }
+
+    if (this.isAutoAspectRatioSupportedMode(newMode)) {
+      if (
+        !this.isAutoAspectRatioSupportedMode(previousMode) ||
+        this.searchRequest.aspectRatio === 'auto'
+      ) {
+        const autoOption = this.aspectRatioOptions.find(
+          r => r.value === 'auto' && !r.disabled,
+        );
+        if (autoOption) {
+          this.selectAspectRatio(autoOption);
+        }
+      }
+    } else if (this.searchRequest.aspectRatio === 'auto') {
+      const squareOrFirst =
+        this.aspectRatioOptions.find(r => r.value === '1:1' && !r.disabled) ||
+        this.aspectRatioOptions.find(r => !r.disabled && r.value !== 'auto');
+      if (squareOrFirst) {
+        this.selectAspectRatio(squareOrFirst);
       }
     }
   }
@@ -676,7 +760,20 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   onModeChanged(mode: string) {
+    const previousMode = this.currentMode;
     this.currentMode = mode;
+    if (
+      mode === 'Video to Image' &&
+      !this.selectedGenerationModelObject?.capabilities?.supportsVideoReference
+    ) {
+      const compatibleModel = this.generationModels.find(
+        m => m.capabilities?.supportsVideoReference,
+      );
+      if (compatibleModel) {
+        this.selectModel(compatibleModel);
+      }
+    }
+    this.updateAspectRatioForMode(previousMode, mode);
     this.saveState();
   }
 
@@ -784,6 +881,21 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
+    let referenceVideo: AssetReferenceDto | undefined;
+    let externalUrl: string | undefined;
+    if (this.currentMode === 'Video to Image') {
+      if (this.referenceVideo) {
+        referenceVideo = {
+          id: this.referenceVideo.id,
+          type: this.referenceVideo.type,
+          index: this.referenceVideo.index,
+        };
+      }
+      if (this.externalUrl) {
+        externalUrl = this.externalUrl;
+      }
+    }
+
     const payload: ImagenRequest = {
       ...this.searchRequest,
       negativePrompt: this.negativePhrases.join(', '),
@@ -797,6 +909,8 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
           ? sourceAssetIds
           : undefined,
       workspaceId: activeWorkspaceId ?? undefined,
+      ...(referenceVideo ? {referenceVideo} : {}),
+      ...(externalUrl ? {externalUrl} : {}),
     };
 
     this.isImageGenerating = true;
@@ -880,9 +994,15 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
     this.negativePhrases = [];
     this.referenceImages = [];
     this.sourceMediaItems = [];
+    this.referenceVideo = null;
+    this.externalUrl = null;
+    this.currentMode = 'Text to Image';
     this.selectedGenerationModel = this.generationModels[0].viewValue;
     this.selectedGenerationModelObject = this.generationModels[0];
-    this.selectedAspectRatio = this.aspectRatioOptions[0].viewValue;
+    this.applyModelSettings(this.selectedGenerationModelObject);
+    this.selectedAspectRatio =
+      this.aspectRatioOptions.find(r => r.value === '1:1')?.viewValue ||
+      this.aspectRatioOptions[0].viewValue;
     this.imageStateService.resetState();
   }
 
@@ -920,7 +1040,9 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     // Switch to Ingredients to Image mode
+    const previousMode = this.currentMode;
     this.currentMode = 'Ingredients to Image';
+    this.updateAspectRatioForMode(previousMode, 'Ingredients to Image');
 
     // Add to reference images
     const refImage: ReferenceImage = {
@@ -1003,14 +1125,31 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
       this.generationModels.find(m => m.value === state.generationModel) ||
         this.generationModels[0],
     );
-    this.selectedAspectRatio =
-      this.aspectRatioOptions.find(r => r.value === state.aspectRatio)
-        ?.viewValue || this.aspectRatioOptions[0].viewValue;
 
     // Switch to Ingredients to Image mode if we have reference images
     if (this.referenceImages.length > 0) {
+      const previousMode = this.currentMode;
       this.currentMode = 'Ingredients to Image';
+      if (state.aspectRatio) {
+        this.applyModelSettings(this.selectedGenerationModelObject);
+        const explicitRatio = this.aspectRatioOptions.find(
+          r => r.value === state.aspectRatio && !r.disabled,
+        );
+        if (explicitRatio) {
+          this.selectAspectRatio(explicitRatio);
+        } else {
+          this.updateAspectRatioForMode(previousMode, 'Ingredients to Image');
+        }
+      } else {
+        this.updateAspectRatioForMode(previousMode, 'Ingredients to Image');
+      }
       this.saveState();
+    } else {
+      this.selectedAspectRatio =
+        this.aspectRatioOptions.find(r => r.value === state.aspectRatio)
+          ?.viewValue ||
+        this.aspectRatioOptions.find(r => r.value === '1:1')?.viewValue ||
+        this.aspectRatioOptions[0].viewValue;
     }
   }
 
@@ -1241,7 +1380,9 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
     }));
 
     if (this.referenceImages.length > 0) {
+      const previousMode = this.currentMode;
       this.currentMode = 'Ingredients to Image';
+      this.updateAspectRatioForMode(previousMode, 'Ingredients to Image');
     }
     this.saveState();
   }
@@ -1276,5 +1417,86 @@ export class HomeComponent implements OnInit, AfterViewInit, OnDestroy {
           handleErrorSnackbar(this._snackBar, err, 'Delete results');
         },
       });
+  }
+
+  openVideoSelectorForReference(): void {
+    const dialogRef = this.dialog.open(ImageSelectorComponent, {
+      width: '90vw',
+      height: '80vh',
+      maxWidth: '90vw',
+      data: {
+        mimeType: 'video/*',
+        multiSelect: false,
+        includeExternal: true,
+      },
+      panelClass: 'image-selector-dialog',
+    });
+
+    dialogRef.afterClosed().subscribe((result: any) => {
+      if (!result) return;
+
+      const res = Array.isArray(result) ? result[0] : result;
+      if ('gcsUri' in res) {
+        this.referenceVideo = {
+          id: res.id,
+          type: 'source_asset',
+          previewUrl: res.presignedThumbnailUrl || res.presignedUrl || '',
+          index: 0,
+        };
+      } else {
+        const thumbnail =
+          res.mediaItem.presignedThumbnailUrls?.[res.selectedIndex];
+        const previewUrl =
+          thumbnail || res.mediaItem.presignedUrls?.[res.selectedIndex];
+        if (previewUrl) {
+          this.referenceVideo = {
+            id: res.mediaItem.id,
+            type: 'media_item',
+            previewUrl: previewUrl,
+            index: res.selectedIndex,
+          };
+        }
+      }
+
+      this.externalUrl = null;
+      this.saveState();
+    });
+  }
+
+  clearReferenceVideo(data: Event | {index: number; event: Event}): void {
+    const event = data instanceof Event ? data : data.event;
+    event.stopPropagation();
+    this.referenceVideo = null;
+    this.saveState();
+  }
+
+  openVideoUrlInputForReference(): void {
+    const dialogRef = this.dialog.open(YouTubeInputComponent, {
+      width: '50vw',
+      panelClass: 'youtube-input-dialog',
+    });
+
+    dialogRef.afterClosed().subscribe((url: string | undefined) => {
+      if (!url) return;
+
+      const videoId = extractYouTubeVideoId(url);
+      if (videoId) {
+        this.externalUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        this.referenceVideo = null;
+        handleInfoSnackbar(this._snackBar, 'YouTube URL added');
+      } else {
+        handleErrorSnackbar(
+          this._snackBar,
+          {message: 'Invalid YouTube URL'},
+          'Validation Error',
+        );
+      }
+      this.saveState();
+    });
+  }
+
+  clearExternalUrl(): void {
+    this.externalUrl = null;
+    this.saveState();
   }
 }

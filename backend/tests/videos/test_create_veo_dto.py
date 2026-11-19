@@ -548,3 +548,131 @@ def test_edit_source_rejects_a_start_frame():
             start_image_asset_id={"id": 9, "type": "source_asset"},
         )
     assert "start frame" in str(exc_info.value)
+
+
+def test_dialogue_model_valid():
+    dto = CreateVeoDto(
+        prompt="Character speaking in tavern",
+        workspace_id=1,
+        generation_model=GenerationModelEnum.VEO_EXP_A2V_GENERATION,
+        start_image_asset_id={"id": 1, "type": "source_asset"},
+        reference_audio={"id": 2, "type": "source_asset"},
+        duration_seconds=8,
+        resolution="1K",
+    )
+    assert dto.generation_model == GenerationModelEnum.VEO_EXP_A2V_GENERATION
+    assert dto.duration_seconds == 8
+    assert dto.resolution == "1K"
+
+
+def test_dialogue_model_missing_audio():
+    with pytest.raises(ValidationError) as exc_info:
+        CreateVeoDto(
+            prompt="Character speaking in tavern",
+            workspace_id=1,
+            generation_model=GenerationModelEnum.VEO_EXP_A2V_GENERATION,
+            start_image_asset_id={"id": 1, "type": "source_asset"},
+            duration_seconds=8,
+            resolution="1K",
+        )
+    assert "requires a reference audio track" in str(exc_info.value)
+
+
+def test_dialogue_model_missing_image():
+    with pytest.raises(ValidationError) as exc_info:
+        CreateVeoDto(
+            prompt="Character speaking in tavern",
+            workspace_id=1,
+            generation_model=GenerationModelEnum.VEO_EXP_A2V_GENERATION,
+            reference_audio={"id": 2, "type": "source_asset"},
+            duration_seconds=8,
+            resolution="1K",
+        )
+    assert "requires a character image" in str(exc_info.value)
+
+
+def test_dialogue_model_invalid_duration():
+    with pytest.raises(ValidationError) as exc_info:
+        CreateVeoDto(
+            prompt="Character speaking in tavern",
+            workspace_id=1,
+            generation_model=GenerationModelEnum.VEO_EXP_A2V_GENERATION,
+            start_image_asset_id={"id": 1, "type": "source_asset"},
+            reference_audio={"id": 2, "type": "source_asset"},
+            duration_seconds=6,
+            resolution="1K",
+        )
+    assert "8-second duration" in str(exc_info.value)
+
+
+def test_dialogue_model_invalid_resolution():
+    with pytest.raises(ValidationError) as exc_info:
+        CreateVeoDto(
+            prompt="Character speaking in tavern",
+            workspace_id=1,
+            generation_model=GenerationModelEnum.VEO_EXP_A2V_GENERATION,
+            start_image_asset_id={"id": 1, "type": "source_asset"},
+            reference_audio={"id": 2, "type": "source_asset"},
+            duration_seconds=8,
+            resolution="4K",
+        )
+    assert "1K resolution" in str(exc_info.value)
+
+
+def test_dialogue_model_conflicting_inputs():
+    with pytest.raises(ValidationError) as exc_info:
+        CreateVeoDto(
+            prompt="Character speaking in tavern",
+            workspace_id=1,
+            generation_model=GenerationModelEnum.VEO_EXP_A2V_GENERATION,
+            start_image_asset_id={"id": 1, "type": "source_asset"},
+            reference_audio={"id": 2, "type": "source_asset"},
+            end_image_asset_id={"id": 3, "type": "source_asset"},
+            duration_seconds=8,
+            resolution="1K",
+        )
+    assert "only supports an image input and an audio reference" in str(
+        exc_info.value
+    )
+
+
+def test_omni_1_2_flash_allows_15s_text_to_video_and_10_ref_images():
+    dto_t2v = CreateVeoDto(
+        prompt="Epic 15-second camera flythrough",
+        workspace_id=1,
+        generation_model=GenerationModelEnum.GEMINI_OMNI_1_2_FLASH,
+        duration_seconds=15,
+    )
+    assert dto_t2v.duration_seconds == 15
+
+    dto_refs = CreateVeoDto(
+        prompt="Cast ensemble shot",
+        workspace_id=1,
+        generation_model=GenerationModelEnum.GEMINI_OMNI_1_2_FLASH,
+        duration_seconds=10,
+        reference_images=[{"asset_id": i} for i in range(1, 11)],
+    )
+    assert len(dto_refs.reference_images) == 10
+
+
+def test_omni_1_2_flash_rejects_over_10s_with_references():
+    with pytest.raises(ValidationError) as exc_info:
+        CreateVeoDto(
+            prompt="Too long for references",
+            workspace_id=1,
+            generation_model=GenerationModelEnum.GEMINI_OMNI_1_2_FLASH,
+            duration_seconds=12,
+            reference_images=[{"asset_id": 1}],
+        )
+    assert "10" in str(exc_info.value)
+
+
+def test_veo_3_1_lite_preview_valid():
+    dto = CreateVeoDto(
+        prompt="Fast cinematic shot",
+        workspace_id=1,
+        generation_model=GenerationModelEnum.VEO_3_1_LITE_PREVIEW,
+        duration_seconds=8,
+        resolution="720p",
+    )
+    assert dto.generation_model == GenerationModelEnum.VEO_3_1_LITE_PREVIEW

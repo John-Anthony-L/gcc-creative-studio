@@ -19,6 +19,7 @@ export type GenerationType = 'IMAGE' | 'VIDEO' | 'AUDIO' | 'TEXT';
 export type GenerationMode =
   | 'Text to Image'
   | 'Ingredients to Image'
+  | 'Video to Image'
   | 'Text to Video'
   | 'Frames to Video'
   | 'Ingredients to Video'
@@ -34,6 +35,12 @@ export interface ModelCapability {
   supportedAspectRatios: string[]; // e.g., ['16:9', '1:1']
   supportedResolutions: ('360p' | '720p' | '1080p' | '1K' | '2K' | '4K')[]; // e.g., ['360p', '1K', '2K', '4K']
   supportedDurations: number[];
+  /**
+   * Maximum duration in seconds allowed in reference/interpolation/extension
+   * modes (e.g., Gemini Omni 1.2 Flash allows up to 15s in Text to Video /
+   * opening-frame-only, and up to 10s with references, end frame, or extend).
+   */
+  maxConstrainedDuration?: number;
   supportsAudio?: boolean; // For video
   supportsNegativePrompt?: boolean;
   supportsGoogleSearch?: boolean;
@@ -81,6 +88,22 @@ export interface ModelCapability {
    * Imagen does not expose it, and Gemini Omni rejects it outright.
    */
   supportsTemperature?: boolean;
+  /**
+   * Whether the model supports a video transform strength slider (0.1 to 1.0).
+   */
+  supportsTransformStrength?: boolean;
+  /**
+   * Whether the model supports configuring diffusion steps (e.g. 1 to 250).
+   */
+  supportsDiffusionSteps?: boolean;
+  /**
+   * Whether the model supports an optional inpainting mask video for localized edits.
+   */
+  supportsMask?: boolean;
+  /**
+   * Whether the model supports intermediate keyframe conditioning for multi-keyframe transform.
+   */
+  supportsConditioningFrames?: boolean;
 }
 
 export interface GenerationModelConfig {
@@ -103,9 +126,14 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
     imageSrc: 'assets/images/banana-peel.png',
     isImage: true,
     capabilities: {
-      supportedModes: ['Text to Image', 'Ingredients to Image'],
+      supportedModes: [
+        'Text to Image',
+        'Ingredients to Image',
+        'Video to Image',
+      ],
       maxReferenceImages: 14,
       supportedAspectRatios: [
+        'auto',
         '1:1',
         '16:9',
         '9:16',
@@ -127,6 +155,7 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       // the shared workflow schemas.
       supportedResolutions: ['1K', '2K', '4K'],
       supportedDurations: [],
+      supportsVideoReference: true,
       supportsTemperature: true,
       supportsGoogleSearch: true,
     },
@@ -138,9 +167,14 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
     imageSrc: 'assets/images/banana-peel.png',
     isImage: true,
     capabilities: {
-      supportedModes: ['Text to Image', 'Ingredients to Image'],
+      supportedModes: [
+        'Text to Image',
+        'Ingredients to Image',
+        'Video to Image',
+      ],
       maxReferenceImages: 14,
       supportedAspectRatios: [
+        'auto',
         '1:1',
         '16:9',
         '9:16',
@@ -158,6 +192,7 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       ], // All
       supportedResolutions: ['1K'],
       supportedDurations: [],
+      supportsVideoReference: true,
       supportsTemperature: true,
       supportsGoogleSearch: true,
     },
@@ -169,9 +204,14 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
     imageSrc: 'assets/images/banana-peel.png',
     isImage: true,
     capabilities: {
-      supportedModes: ['Text to Image', 'Ingredients to Image'],
+      supportedModes: [
+        'Text to Image',
+        'Ingredients to Image',
+        'Video to Image',
+      ],
       maxReferenceImages: 14,
       supportedAspectRatios: [
+        'auto',
         '1:1',
         '16:9',
         '9:16',
@@ -186,6 +226,7 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       // Verified against the live API at 1K, 2K and 4K. 512 is rejected.
       supportedResolutions: ['1K', '2K', '4K'],
       supportedDurations: [],
+      supportsVideoReference: true,
       supportsTemperature: true,
       supportsGoogleSearch: true,
     },
@@ -197,9 +238,14 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
     imageSrc: 'assets/images/banana-peel.png',
     isImage: true,
     capabilities: {
-      supportedModes: ['Text to Image', 'Ingredients to Image'],
+      supportedModes: [
+        'Text to Image',
+        'Ingredients to Image',
+        'Video to Image',
+      ],
       maxReferenceImages: 2,
       supportedAspectRatios: [
+        'auto',
         '1:1',
         '16:9',
         '9:16',
@@ -216,6 +262,7 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       // were getting a resolution they never received.
       supportedResolutions: ['1K'],
       supportedDurations: [],
+      supportsVideoReference: true,
       supportsTemperature: true,
     },
   },
@@ -279,6 +326,35 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
   },
   // --- Video Models ---
   {
+    value: 'gemini-omni-1.2-flash',
+    viewValue: 'Gemini Omni 1.2 Flash',
+    type: 'VIDEO',
+    icon: 'layers',
+    capabilities: {
+      supportedModes: [
+        'Text to Video',
+        'Ingredients to Video',
+        'Frames to Video',
+        'Edit Video',
+        'Extend Video',
+      ],
+      maxReferenceImages: 10,
+      supportedAspectRatios: ['16:9', '9:16'],
+      supportedResolutions: ['360p', '1K', '2K', '4K'],
+      supportedDurations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      maxConstrainedDuration: 10,
+      supportsAudio: true,
+      supportsNegativePrompt: false,
+      supportsLastFrame: true,
+      supportsVideoReference: true,
+      maxReferenceVideos: 3,
+      supportsAudioReference: false,
+      maxOutputs: 4,
+      supportsRoleTags: true,
+      supportsFrameWithReferences: true,
+    },
+  },
+  {
     value: 'gemini-omni-1.1-flash-preview',
     viewValue: 'Gemini Omni 1.1 Flash (Preview)',
     type: 'VIDEO',
@@ -332,6 +408,47 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       maxOutputs: 4,
       supportsRoleTags: true,
       supportsFrameWithReferences: true,
+    },
+  },
+  {
+    value: 'veo-exp-a2v-generation',
+    viewValue: 'Veo Dialogue Lip Sync',
+    type: 'VIDEO',
+    icon: 'record_voice_over',
+    capabilities: {
+      supportedModes: ['Ingredients to Video'],
+      maxReferenceImages: 1,
+      supportedAspectRatios: ['16:9', '9:16'],
+      supportedResolutions: ['1K'],
+      supportedDurations: [8],
+      supportsAudio: true,
+      supportsAudioReference: true,
+      supportsLastFrame: false,
+      supportsNegativePrompt: false,
+      supportsVideoReference: false,
+      maxOutputs: 1,
+    },
+  },
+  {
+    value: 'veo-exp-video-transform',
+    viewValue: 'Veo Video Transform / Restyle',
+    type: 'VIDEO',
+    icon: 'auto_fix_high',
+    capabilities: {
+      supportedModes: ['Edit Video', 'Frames to Video'],
+      maxReferenceImages: 0,
+      supportedAspectRatios: ['16:9', '9:16'],
+      supportedResolutions: ['1K'],
+      supportedDurations: [4, 5, 6, 7, 8],
+      supportsAudio: true,
+      supportsVideoReference: false,
+      supportsLastFrame: true,
+      supportsMask: true,
+      supportsConditioningFrames: true,
+      supportsTransformStrength: true,
+      supportsDiffusionSteps: true,
+      supportsSeed: true,
+      maxOutputs: 1,
     },
   },
   {
@@ -398,6 +515,33 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
   },
   {
     value: 'veo-3.1-lite-generate-001',
+    viewValue: 'Veo 3.1 Lite',
+    type: 'VIDEO',
+    icon: 'volume_up',
+    capabilities: {
+      supportedModes: [
+        'Text to Video',
+        'Ingredients to Video',
+        'Frames to Video',
+        'Extend Video',
+        'Concatenate Video',
+      ],
+      maxReferenceImages: 3,
+      supportedAspectRatios: ['16:9', '9:16'],
+      supportedResolutions: ['1K', '2K'],
+      // Veo offers fixed lengths, not a range: 5s and 7s are not valid.
+      supportedDurations: [4, 6, 8],
+      supportsAudio: true,
+      supportsNegativePrompt: true,
+      supportsLastFrame: true,
+      supportsVideoReference: false,
+      supportsAudioReference: false,
+      maxOutputs: 4,
+      restrictsDurationOutsideTextToVideo: true,
+    },
+  },
+  {
+    value: 'veo-3.1-lite-generate-preview',
     viewValue: 'Veo 3.1 Lite (Preview)',
     type: 'VIDEO',
     icon: 'volume_up',
@@ -453,8 +597,42 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
 
   // --- Audio Models ---
   {
+    value: 'lyria-3-clip-preview',
+    viewValue: 'Lyria 3 Clip Preview',
+    type: 'AUDIO',
+    icon: 'music_note',
+    capabilities: {
+      supportedModes: ['Text to Audio'],
+      maxReferenceImages: 0,
+      supportedAspectRatios: [],
+      supportedResolutions: [],
+      supportedDurations: [],
+      supportsSeed: false,
+      supportsNegativePrompt: true,
+      supportsVoice: false,
+      supportsLanguage: false,
+    },
+  },
+  {
+    value: 'lyria-3-pro-preview',
+    viewValue: 'Lyria 3 Pro Preview',
+    type: 'AUDIO',
+    icon: 'music_note',
+    capabilities: {
+      supportedModes: ['Text to Audio'],
+      maxReferenceImages: 0,
+      supportedAspectRatios: [],
+      supportedResolutions: [],
+      supportedDurations: [],
+      supportsSeed: false,
+      supportsNegativePrompt: true,
+      supportsVoice: false,
+      supportsLanguage: false,
+    },
+  },
+  {
     value: 'lyria-002',
-    viewValue: 'Lyria',
+    viewValue: 'Lyria 2',
     type: 'AUDIO',
     icon: 'music_note',
     capabilities: {
@@ -470,8 +648,25 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
     },
   },
   {
+    value: 'gemini-3.1-flash-tts-preview',
+    viewValue: 'Gemini 3.1 Flash TTS Preview',
+    type: 'AUDIO',
+    icon: 'record_voice_over',
+    capabilities: {
+      supportedModes: ['Text to Audio'],
+      maxReferenceImages: 0,
+      supportedAspectRatios: [],
+      supportedResolutions: [],
+      supportedDurations: [],
+      supportsVoice: true,
+      supportsLanguage: true,
+      supportsSeed: false,
+      supportsNegativePrompt: false,
+    },
+  },
+  {
     value: 'gemini-2.5-flash-tts',
-    viewValue: 'Gemini TTS',
+    viewValue: 'Gemini 2.5 Flash TTS',
     type: 'AUDIO',
     icon: 'record_voice_over',
     capabilities: {
@@ -505,8 +700,12 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
   },
 ];
 
+export const ASPECT_RATIO_AUTO = 'auto';
+export const ASPECT_RATIO_SQUARE = '1:1';
+
 export const ASPECT_RATIO_LABELS: Record<string, string> = {
-  '1:1': '1:1 (Square)',
+  [ASPECT_RATIO_AUTO]: 'Auto (Dynamic)',
+  [ASPECT_RATIO_SQUARE]: '1:1 (Square)',
   '16:9': '16:9 (Landscape)',
   '9:16': '9:16 (Portrait)',
   '4:3': '4:3 (Standard)',
@@ -521,3 +720,38 @@ export const ASPECT_RATIO_LABELS: Record<string, string> = {
   '1:8': '1:8 (Tall Ribbon)',
   '8:1': '8:1 (Wide Ribbon)',
 };
+
+export function isGeminiOmniModel(modelValue?: string | null): boolean {
+  return !!modelValue?.startsWith('gemini-omni');
+}
+
+export function getSupportedModelDurations(
+  model: GenerationModelConfig | undefined,
+  mode?: string,
+  resolution?: string,
+  hasEndFrame = false,
+  hasReferences = false,
+): number[] {
+  const durations = model?.capabilities?.supportedDurations || [];
+  if (!durations.length) return [];
+
+  const normalizedRes = resolution === '720p' ? '1K' : resolution;
+  if (
+    model?.capabilities?.restrictsDurationOutsideTextToVideo &&
+    (mode !== 'Text to Video' || normalizedRes !== '1K')
+  ) {
+    return [durations[durations.length - 1]];
+  }
+
+  const constrainedMax = model?.capabilities?.maxConstrainedDuration;
+  if (
+    constrainedMax !== undefined &&
+    (mode === 'Ingredients to Video' ||
+      mode === 'Extend Video' ||
+      (mode === 'Frames to Video' && (hasEndFrame || hasReferences)))
+  ) {
+    return durations.filter(d => d <= constrainedMax);
+  }
+
+  return durations;
+}

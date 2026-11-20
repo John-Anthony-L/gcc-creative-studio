@@ -310,10 +310,19 @@ export class GenericStepComponent implements OnInit, OnChanges, OnDestroy {
     if (!modelConfig) return;
 
     const currentMode = this.stepForm.get('settings.input_mode')?.value;
-    const durations = getSupportedModelDurations(modelConfig, {
-      inputMode: currentMode,
-      hasReferenceAssets: currentMode === 'Ingredients to Video',
-    });
+    const currentResolution = this.stepForm.get('settings.resolution')?.value;
+    const hasEndFrame = !!this.stepForm.get('inputs.end_frame')?.value;
+    const hasReferences =
+      currentMode === 'Ingredients to Video' ||
+      !!this.stepForm.get('inputs.input_images')?.value?.length ||
+      !!this.stepForm.get('inputs.input_video')?.value?.length;
+    const durations = getSupportedModelDurations(
+      modelConfig,
+      currentMode,
+      currentResolution,
+      hasEndFrame,
+      hasReferences,
+    );
 
     if (durations.length === 0) {
       durationSetting.hidden = true;

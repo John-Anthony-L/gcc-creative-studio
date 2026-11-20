@@ -37,7 +37,7 @@ export type ImagenRequest = {
    * model's own default. Imagen and Gemini Omni do not accept it.
    */
   temperature?: number;
-  resolution?: '512' | '1K' | '2K' | '4K';
+  resolution?: '1K' | '2K' | '4K';
   referenceVideo?: AssetReferenceDto;
   externalUrl?: string | null;
 };

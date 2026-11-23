@@ -632,13 +632,7 @@ export class VideoComponent implements OnInit, AfterViewInit {
 
   /** First model that supports a mode, preferring Omni 1.2 / Veo 3.1. */
   private findModelForMode(mode: string) {
-    const preferred = [
-      'veo-3.1-generate-001',
-      DEFAULT_OMNI_MODEL,
-      'gemini-omni-1.1-flash-preview',
-      'gemini-omni-1.1-flash',
-      'gemini-omni-flash-preview',
-    ];
+    const preferred = ['veo-3.1-generate-001', DEFAULT_OMNI_MODEL];
     for (const value of preferred) {
       const candidate = this.generationModels.find(m => m.value === value);
       if (

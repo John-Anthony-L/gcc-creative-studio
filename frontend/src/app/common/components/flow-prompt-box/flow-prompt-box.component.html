@@ -82,9 +82,9 @@
         @if (hasResolutionOptions()) {
           <button
             (click)="toggleSettingsMenu(); $event.stopPropagation()"
-            class="rounded-md bg-neutral-800 px-2 py-1.5 cursor-pointer hover:bg-neutral-700"
+            class="rounded-md bg-neutral-800 px-2 py-1 cursor-pointer hover:bg-neutral-700"
           >
-            <mat-icon class="!h-4 !w-4 !flex !items-center !justify-center">{{ selectedResolution() | lowercase }}</mat-icon>
+            {{ getResolutionLabel(selectedResolution()) }}
           </button>
         }
         <!--

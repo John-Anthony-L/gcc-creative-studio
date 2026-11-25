@@ -312,6 +312,45 @@ export class MediaLightboxComponent
     return this.selectedUrl || '';
   }
 
+  get masterDownloadUrl(): string | undefined {
+    return (
+      this.mediaItem?.masterPresignedUrls?.[this.selectedIndex] || undefined
+    );
+  }
+
+  get masterFormatLabel(): string {
+    const itemAny = this.mediaItem as Record<string, any> | undefined;
+    const rawData = itemAny?.['rawData'] || itemAny?.['raw_data'];
+    const codec =
+      rawData?.['output_codec'] ||
+      rawData?.['outputCodec'] ||
+      itemAny?.['output_codec'] ||
+      itemAny?.['outputCodec'];
+    if (codec === 'prores') {
+      return 'ProRes (.mov)';
+    }
+    if (codec === 'dnxhr') {
+      return 'DNxHR (.mxf)';
+    }
+    return 'Master';
+  }
+
+  downloadMaster(): void {
+    const url = this.masterDownloadUrl;
+    if (!url || this.isDownloading) {
+      return;
+    }
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
   openInNewTab(): void {
     if (!this.selectedUrl || this.isDownloading) {
       return;

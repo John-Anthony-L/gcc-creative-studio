@@ -619,3 +619,77 @@ class TestDialogueMediaOps:
         data = json.loads(probe.stdout)["streams"][0]
         assert data["width"] == 720
         assert data["height"] == 1280
+
+
+class TestGmpMediaOps:
+    """Tests for GMP preview transcode, 720p@24fps normalization, and audio extraction."""
+
+    def test_transcode_to_h264_preview_from_prores(
+        self, source: Path, tmp_path: Path
+    ):
+        from src.videos.vpe.media_ops import transcode_to_h264_preview
+
+        prores_mov = tmp_path / "master.mov"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-t",
+                "1",
+                "-c:v",
+                "prores_ks",
+                "-profile:v",
+                "3",
+                "-c:a",
+                "pcm_s16le",
+                str(prores_mov),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        preview = transcode_to_h264_preview(
+            prores_mov, tmp_path / "preview.mp4"
+        )
+        assert preview.exists()
+        assert _frame_count(preview) == 24
+        assert has_audio_stream(preview) is True
+
+    def test_normalize_video_720p_24fps_and_extract_audio(
+        self, source: Path, tmp_path: Path
+    ):
+        from src.videos.vpe.media_ops import (
+            extract_audio_wav,
+            normalize_video_720p_24fps,
+        )
+
+        norm = normalize_video_720p_24fps(
+            source, tmp_path / "norm_720p.mp4", max_frames=48
+        )
+        assert norm.exists()
+        assert _frame_count(norm) == 48
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(norm),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        stream = json.loads(probe.stdout)["streams"][0]
+        assert (stream["width"], stream["height"]) == (1280, 720)
+
+        wav = extract_audio_wav(source, tmp_path / "extracted.wav")
+        assert wav is not None and wav.exists()

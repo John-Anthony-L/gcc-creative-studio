@@ -230,4 +230,33 @@ describe('MediaLightboxComponent', () => {
 
     expect(actionButton(TAGS)).toBeUndefined();
   });
+
+  it('shows Download ProRes (.mov) when masterPresignedUrls has a ProRes master', () => {
+    show({
+      ...videoItem(),
+      masterPresignedUrls: ['https://storage.test/master_0.mov'],
+      rawData: {output_codec: 'prores'},
+    });
+
+    expect(component.masterDownloadUrl).toBe(
+      'https://storage.test/master_0.mov',
+    );
+    expect(component.masterFormatLabel).toBe('ProRes (.mov)');
+    expect(
+      actionButton('high_quality Download ProRes (.mov)'),
+    ).toBeDefined();
+  });
+
+  it('shows Download DNxHR (.mxf) when masterPresignedUrls has a DNxHR master', () => {
+    show({
+      ...videoItem(),
+      masterPresignedUrls: ['https://storage.test/master_0.mxf'],
+      rawData: {output_codec: 'dnxhr'},
+    });
+
+    expect(component.masterFormatLabel).toBe('DNxHR (.mxf)');
+    expect(
+      actionButton('high_quality Download DNxHR (.mxf)'),
+    ).toBeDefined();
+  });
 });

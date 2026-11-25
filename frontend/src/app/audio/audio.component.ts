@@ -185,7 +185,7 @@ export class AudioComponent implements OnInit {
     {id: VoiceEnum.ZEPHYR, name: 'Zephyr (Female)', type: 'preset'},
     {id: VoiceEnum.ZUBENELGENUBI, name: 'Zubenelgenubi (Male)', type: 'preset'},
   ];
-  private path = '../../assets/images';
+  private path = 'assets/images';
 
   constructor(
     private searchService: SearchService,

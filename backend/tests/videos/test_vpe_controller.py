@@ -47,9 +47,21 @@ from src.common.base_dto import MimeTypeEnum
 from src.config.config_service import config_service
 from src.galleries.dto.gallery_response_dto import MediaItemResponse
 from src.users.user_model import UserModel, UserRoleEnum
-from src.videos.vpe.capabilities import VpeCapabilityId, get_capability
-from src.videos.vpe.gating import VpeScreeningResult, screen_stored_video
-from src.videos.vpe_controller import require_vpe_enabled, router
+from src.videos.vpe.capabilities import (
+    VPE_CAPABILITY_LIST,
+    VpeCapabilityId,
+    get_capability,
+)
+from src.videos.vpe.gating import (
+    VpeScreeningResult,
+    screen_stored_video,
+    screen_upscale_candidate,
+)
+from src.videos.vpe_controller import (
+    config_router,
+    require_vpe_enabled,
+    router,
+)
 from src.videos.vpe_service import MAX_SEGMENTS_PER_JOB, VpeService
 from src.workspaces.workspace_auth_guard import WorkspaceAuth
 
@@ -71,15 +83,7 @@ _SHARPNESS = _UPSCALE.parameter("sharpness")
 
 
 def _screening(**row) -> VpeScreeningResult:
-    """Screens a row the way the service does.
-
-    Args:
-        **row: ``duration_seconds`` and ``resolution``, as the gallery
-            stores them.
-
-    Returns:
-        The screening outcome, with the upscaler's splitting credit applied.
-    """
+    """Screens a row the way the service does."""
     return screen_stored_video(
         _UPSCALE,
         max_segments=MAX_SEGMENTS_PER_JOB,
@@ -88,11 +92,7 @@ def _screening(**row) -> VpeScreeningResult:
 
 
 def _placeholder() -> MediaItemResponse:
-    """Builds the processing row an accepted upscale returns.
-
-    Returns:
-        The row the gallery shows while the job runs.
-    """
+    """Builds the processing row an accepted upscale returns."""
     return MediaItemResponse(
         id=99,
         workspace_id=1,
@@ -140,26 +140,11 @@ def fixture_mock_workspace_auth():
 
 @pytest.fixture(name="app")
 def fixture_app(mock_user, mock_vpe_service, mock_workspace_auth, monkeypatch):
-    """Mounts the router on a bare app with both thread pools present.
-
-    Both pools are real ``MagicMock`` objects rather than one, so a test can
-    tell which of them a job was handed to. Sharing them would make the
-    distinction unobservable, which is the distinction most worth keeping.
-
-    Args:
-        mock_user: The authenticated caller.
-        mock_vpe_service: The stand-in service.
-        mock_workspace_auth: The stand-in workspace guard.
-        monkeypatch: pytest's patcher, for the deployment flag.
-
-    Returns:
-        The configured application.
-    """
-    # The gate is left real and switched on, so every test below exercises
-    # it rather than an override that would hide it going missing.
+    """Mounts both router and config_router on a bare app."""
     monkeypatch.setattr(config_service, "VPE_ENABLED", True)
 
     application = FastAPI()
+    application.include_router(config_router)
     application.include_router(router)
     application.state.executor = MagicMock(name="general_executor")
     application.state.vpe_executor = MagicMock(name="vpe_executor")
@@ -495,3 +480,103 @@ class TestRequestValidation:
 
         queued = mock_vpe_service.start_upscale_job.await_args.kwargs
         assert queued["request_dto"].resolution == "4k"
+
+    def test_gmp_upscale_fields_and_codec_validations(
+        self, client, mock_vpe_service
+    ):
+        resp = client.post(
+            "/api/videos/vpe/upscale",
+            json={
+                "workspaceId": 1,
+                "mediaItemId": 2,
+                "upscaleMode": "8k",
+                "steps": 2,
+                "seed": 99,
+                "outputCodec": "prores",
+                "compressionQuality": "lossless",
+            },
+        )
+        assert resp.status_code == 200
+        dto = mock_vpe_service.start_upscale_job.await_args.kwargs[
+            "request_dto"
+        ]
+        assert dto.resolved_mode == "8k"
+        assert dto.steps == 2
+        assert dto.seed == 99
+        assert dto.output_codec == "prores"
+        assert dto.compression_quality == "lossless"
+
+        # Lossless H.264 rejected
+        bad_h264 = client.post(
+            "/api/videos/vpe/upscale",
+            json={
+                "workspaceId": 1,
+                "mediaItemId": 2,
+                "outputCodec": "h264",
+                "compressionQuality": "lossless",
+            },
+        )
+        assert bad_h264.status_code == 422
+
+        # 8K lossless DNxHR rejected
+        bad_8k_dnxhr = client.post(
+            "/api/videos/vpe/upscale",
+            json={
+                "workspaceId": 1,
+                "mediaItemId": 2,
+                "upscaleMode": "8k",
+                "outputCodec": "dnxhr",
+                "compressionQuality": "lossless",
+            },
+        )
+        assert bad_8k_dnxhr.status_code == 422
+
+
+class TestVpeConfigEndpoint:
+    """GET /api/videos/vpe/config must remain open when VPE_ENABLED is False."""
+
+    def test_config_router_does_not_carry_require_vpe_enabled(self):
+        gates = [
+            dependency.dependency for dependency in config_router.dependencies
+        ]
+        assert require_vpe_enabled not in gates
+
+    def test_config_endpoint_when_enabled(self, client, monkeypatch):
+        monkeypatch.setattr(config_service, "VPE_ENABLED", True)
+        response = client.get("/api/videos/vpe/config")
+        assert response.status_code == 200
+        assert response.json() == {
+            "enabled": True,
+            "capabilities": [
+                c.capability_id.value for c in VPE_CAPABILITY_LIST
+            ],
+        }
+
+    def test_config_endpoint_when_disabled_returns_200_false(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(config_service, "VPE_ENABLED", False)
+        response = client.get("/api/videos/vpe/config")
+        assert response.status_code == 200
+        assert response.json() == {"enabled": False, "capabilities": []}
+
+    def test_screening_exposes_supported_modes_for_4k_and_seamless(
+        self, client, mock_vpe_service
+    ):
+        mock_vpe_service.screen_media_item.return_value = (
+            screen_upscale_candidate(duration_seconds=8.0, resolution="4K")
+        )
+        res_4k = client.get("/api/videos/vpe/screening/2")
+        assert res_4k.status_code == 200
+        assert res_4k.json()["supported_modes"] == ["8k"]
+
+        mock_vpe_service.screen_media_item.return_value = (
+            screen_upscale_candidate(
+                duration_seconds=8.0,
+                resolution="1K",
+                raw_data={"seamless": {"loop": True}},
+            )
+        )
+        res_seamless = client.get("/api/videos/vpe/screening/2")
+        assert res_seamless.status_code == 200
+        assert res_seamless.json()["supported_modes"] == ["4k"]

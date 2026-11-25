@@ -202,6 +202,17 @@
       </studio-button>
 
       <studio-button
+        *ngIf="showDownloadButton && masterDownloadUrl"
+        variant="primary"
+        size="medium"
+        (click)="downloadMaster()"
+        [matTooltip]="'Download full mezzanine ' + masterFormatLabel + ' master'"
+      >
+        <mat-icon>high_quality</mat-icon>
+        Download {{ masterFormatLabel }}
+      </studio-button>
+
+      <studio-button
         *ngIf="showSeeMoreInfoButton"
         variant="primary"
         shape="circle"

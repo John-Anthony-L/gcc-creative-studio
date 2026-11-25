@@ -612,3 +612,445 @@ class TestWorkspaceGcsHelpers:
             await _resolve_asset_ref_uri(ref_media, media_repo, source_repo)
             == "gs://custom-bucket/v1.mp4"
         )
+
+
+class TestGmpScreeningAndDualDelivery:
+    """Tests for GMP Super-Res screening, ProRes/DNxHR dual delivery, and workers."""
+
+    def test_check_super_res_upscalable_rules(self):
+        from src.videos.vpe_service import check_super_res_upscalable
+
+        # 4K input allowed ONLY with MODE_8K
+        check_super_res_upscalable(
+            _probe(width=3840, height=2160, frame_count=192), "MODE_8K"
+        )
+        with pytest.raises(VpeJobError, match="MODE_8K"):
+            check_super_res_upscalable(
+                _probe(width=3840, height=2160, frame_count=192), "MODE_4K"
+            )
+
+        # Cinema DCI 2048x1080 at 30fps passes MODE_4K_PRO
+        check_super_res_upscalable(
+            _probe(width=2048, height=1080, fps=30, frame_count=150),
+            "MODE_4K_PRO",
+        )
+
+    @pytest.mark.anyio
+    async def test_screen_and_start_upscale_job_for_4k_and_seamless(
+        self, monkeypatch
+    ):
+        from fastapi import HTTPException
+
+        _settings(
+            monkeypatch,
+            enabled=True,
+            bucket="vpe-bucket",
+            project_id="vpe-project",
+        )
+        media_repo = AsyncMock()
+        row_4k = _row(duration_seconds=8.0, resolution="4K")
+        row_4k.raw_data = {}
+        media_repo.get_by_id = AsyncMock(return_value=row_4k)
+
+        def _create_side_effect(item):
+            item.id = 501
+            return item
+
+        media_repo.create = AsyncMock(side_effect=_create_side_effect)
+        service = VpeService(
+            media_repo=media_repo,
+            source_asset_repo=AsyncMock(),
+            gcs_service=AsyncMock(),
+            iam_signer=MagicMock(),
+        )
+        screen_res = await service.screen_media_item(7)
+        assert screen_res.offer is True
+        assert screen_res.supported_modes == ("8k",)
+
+        user = UserModel(
+            id=1,
+            email="user@example.com",
+            name="Test User",
+            roles=[UserRoleEnum.USER],
+        )
+
+        # Asking for 4k on a 4K clip is rejected with 400
+        with pytest.raises(HTTPException) as exc_400:
+            await service.start_upscale_job(
+                request_dto=UpscaleVideoDto(
+                    workspace_id=1, media_item_id=7, upscale_mode="4k"
+                ),
+                user=user,
+                executor=Mock(),
+            )
+        assert exc_400.value.status_code == 400
+
+        # Asking for 8k queues VEO_EXP_SUPER_RES
+        executor = Mock()
+        resp = await service.start_upscale_job(
+            request_dto=UpscaleVideoDto(
+                workspace_id=1,
+                media_item_id=7,
+                upscale_mode="8k",
+                output_codec="prores",
+                compression_quality="lossless",
+            ),
+            user=user,
+            executor=executor,
+        )
+        assert resp.model == GenerationModelEnum.VEO_EXP_SUPER_RES
+        assert executor.submit.called
+
+    @pytest.mark.anyio
+    async def test_deliver_gmp_output_dual_asset_prores_and_dnxhr(
+        self, tmp_path
+    ):
+        from src.videos.vpe.client import VpeResult, VpeVideoOutput
+        from src.videos.vpe_service import _deliver_gmp_output
+
+        vpe_gcs = MagicMock()
+        app_gcs = MagicMock()
+
+        def _fake_download(gcs_uri_path, destination_file_path):
+            _ = gcs_uri_path
+            with open(destination_file_path, "wb") as handle:
+                handle.write(b"fake-prores-bytes")
+            return destination_file_path
+
+        vpe_gcs.download_from_gcs.side_effect = _fake_download
+        app_gcs.upload_file_to_gcs.side_effect = (
+            lambda local_path, destination_blob_name, mime_type=None: (
+                f"gs://ws-bucket/{destination_blob_name}"
+            )
+        )
+
+        fake_result = VpeResult(
+            operation_name="op-prores-1",
+            videos=(
+                VpeVideoOutput(
+                    gcs_uri="gs://vpe-bucket/out/sample_0.mov",
+                    mime_type="video/quicktime",
+                ),
+            ),
+            rai_media_filtered_count=0,
+            raw={},
+        )
+
+        def _fake_transcode(src, dst):
+            _ = src
+            dst.write_bytes(b"fake-h264-preview")
+            return dst
+
+        with (
+            patch(
+                "src.videos.vpe_service.transcode_to_h264_preview",
+                side_effect=_fake_transcode,
+            ) as mock_transcode,
+            patch(
+                "src.videos.vpe_service.generate_thumbnail",
+                return_value=str(tmp_path / "thumb.png"),
+            ),
+            patch(
+                "src.videos.vpe_service.build_measured_metadata",
+                return_value={"resolution": "4K", "duration_seconds": 8.0},
+            ),
+        ):
+            delivered = await _deliver_gmp_output(
+                result=fake_result,
+                output_codec="prores",
+                compression_quality="lossless",
+                dest_prefix="generated_videos/omni_cine_88",
+                work=tmp_path,
+                vpe_gcs=vpe_gcs,
+                app_gcs=app_gcs,
+                base_raw_data={"vpe_capability": "omni_cine"},
+            )
+
+        assert mock_transcode.called
+        assert delivered["gcs_uris"] == [
+            "gs://ws-bucket/generated_videos/omni_cine_88.mp4"
+        ]
+        assert delivered["raw_data"]["master_gcs_uris"] == [
+            "gs://ws-bucket/generated_videos/omni_cine_88_master.mov"
+        ]
+        assert delivered["raw_data"]["output_codec"] == "prores"
+        assert delivered["raw_data"]["compression_quality"] == "lossless"
+
+    def test_gmp_workers_execute_end_to_end_with_mocked_infra(
+        self, monkeypatch, tmp_path
+    ):
+        from contextlib import asynccontextmanager
+
+        from src.videos.dto.create_veo_dto import CreateVeoDto
+        from src.videos.vpe.client import (
+            VpeOperation,
+            VpeResult,
+            VpeVideoOutput,
+        )
+        from src.videos.vpe_service import (
+            _process_vpe_omni_cine_in_background,
+            _process_vpe_omni_perf_in_background,
+            _process_vpe_perf_estimation_in_background,
+            _process_vpe_upscale_in_background,
+            _process_vpe_video_textures_in_background,
+        )
+
+        _ = tmp_path
+        _settings(
+            monkeypatch,
+            enabled=True,
+            bucket="vpe-bucket",
+            project_id="vpe-project",
+        )
+
+        updates: list[tuple[int, dict]] = []
+        submitted_payloads: list[dict] = []
+
+        @asynccontextmanager
+        async def _fake_db_session():
+            yield AsyncMock()
+
+        @asynccontextmanager
+        async def _fake_worker_db():
+            yield _fake_db_session
+
+        mock_media_repo = MagicMock()
+        mock_media_repo.get_by_id = AsyncMock(
+            return_value=MagicMock(
+                workspace_id=1,
+                gcs_uris=["gs://ws-bucket/in.mp4"],
+                raw_data={},
+            )
+        )
+
+        async def _fake_update(item_id, fields):
+            updates.append((item_id, fields))
+
+        mock_media_repo.update = AsyncMock(side_effect=_fake_update)
+
+        mock_source_repo = MagicMock()
+        mock_source_repo.get_by_id = AsyncMock(
+            side_effect=lambda aid: MagicMock(
+                gcs_uri=(
+                    f"gs://ws-bucket/asset_{aid}.wav"
+                    if aid == 99
+                    else (
+                        f"gs://ws-bucket/asset_{aid}.mp4"
+                        if aid >= 50
+                        else f"gs://ws-bucket/asset_{aid}.png"
+                    )
+                )
+            )
+        )
+
+        async def _fake_download_asset(uri, local_path, *_args, **_kwargs):
+            _ = uri
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(b"raw")
+            return True
+
+        mock_gcs = MagicMock()
+        mock_gcs.upload_file_to_gcs.side_effect = (
+            lambda local_path, destination_blob_name, mime_type=None: (
+                f"gs://vpe-bucket/{destination_blob_name}"
+            )
+        )
+
+        def _fake_dl(gcs_uri_path, destination_file_path):
+            _ = gcs_uri_path
+            with open(destination_file_path, "wb") as fh:
+                fh.write(b"out")
+            return destination_file_path
+
+        mock_gcs.download_from_gcs.side_effect = _fake_dl
+
+        mock_client = MagicMock()
+
+        def _fake_submit(payload):
+            submitted_payloads.append(payload)
+            return VpeOperation.from_body(
+                {
+                    "name": f"operations/op-{len(submitted_payloads)}",
+                    "done": True,
+                    "response": {
+                        "videos": [
+                            {
+                                "gcsUri": "gs://vpe-bucket/out/video.mov",
+                                "mimeType": "video/quicktime",
+                            }
+                        ]
+                    },
+                }
+            )
+
+        mock_client.submit.side_effect = _fake_submit
+        mock_client.wait_for_completion_sync.return_value = VpeResult(
+            operation_name="op-done",
+            videos=(
+                VpeVideoOutput(
+                    gcs_uri="gs://vpe-bucket/out/video.mov",
+                    mime_type="video/quicktime",
+                ),
+            ),
+            rai_media_filtered_count=0,
+            raw={},
+        )
+
+        def _touch_target(_src, dst, *_args, **_kwargs):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"norm")
+            return dst
+
+        with (
+            patch("src.videos.vpe_service.WorkerDatabase", _fake_worker_db),
+            patch(
+                "src.videos.vpe_service.MediaRepository",
+                return_value=mock_media_repo,
+            ),
+            patch(
+                "src.videos.vpe_service.SourceAssetRepository",
+                return_value=mock_source_repo,
+            ),
+            patch(
+                "src.videos.vpe_service._resolve_workspace_gcs_config",
+                new=AsyncMock(return_value=("ws-proj", "ws-bucket")),
+            ),
+            patch("src.videos.vpe_service.GcsService", return_value=mock_gcs),
+            patch("src.videos.vpe_service.VpeClient", return_value=mock_client),
+            patch(
+                "src.videos.vpe_service._download_asset_gcs",
+                side_effect=_fake_download_asset,
+            ),
+            patch(
+                "src.videos.vpe_service.normalize_video_720p_24fps",
+                side_effect=_touch_target,
+            ),
+            patch(
+                "src.videos.vpe_service.extract_audio_wav",
+                side_effect=_touch_target,
+            ),
+            patch(
+                "src.videos.vpe_service.transcode_to_h264_preview",
+                side_effect=_touch_target,
+            ),
+            patch(
+                "src.videos.vpe_service.has_audio_stream",
+                return_value=True,
+            ),
+            patch(
+                "src.videos.vpe_service.generate_thumbnail",
+                return_value=None,
+            ),
+            patch(
+                "src.videos.vpe_service.build_measured_metadata",
+                return_value={"resolution": "1K", "duration_seconds": 8.0},
+            ),
+            patch(
+                "src.videos.vpe_service.probe_media",
+                return_value=_probe(width=1920, height=1080, frame_count=192),
+            ),
+        ):
+            # 1. Perf Estimation worker
+            _process_vpe_perf_estimation_in_background(
+                101,
+                CreateVeoDto(
+                    prompt="",
+                    workspace_id=1,
+                    generation_model=GenerationModelEnum.VEO_EXP_PERF_ESTIMATION,
+                    edit_source={"id": 50, "type": "source_asset"},
+                ),
+                "u@test.com",
+            )
+            # 2. Omni-Perf worker (2-step: perf-estimation -> omni-perf + audio extract)
+            _process_vpe_omni_perf_in_background(
+                102,
+                CreateVeoDto(
+                    prompt="Hero performance",
+                    workspace_id=1,
+                    generation_model=GenerationModelEnum.OMNI_PERF,
+                    reference_images=[{"asset_id": 1}],
+                    reference_video={"id": 51, "type": "source_asset"},
+                    audio_control_mode="preserve_video_audio",
+                    output_codec="prores",
+                    compression_quality="lossless",
+                ),
+                "u@test.com",
+            )
+            # 3. Omni-Cine worker (videoTransform + mask + target_audio)
+            _process_vpe_omni_cine_in_background(
+                103,
+                CreateVeoDto(
+                    prompt="Cinematic rainstorm",
+                    workspace_id=1,
+                    generation_model=GenerationModelEnum.OMNI_CINE,
+                    start_image_asset_id={"id": 1, "type": "source_asset"},
+                    end_image_asset_id={"id": 2, "type": "source_asset"},
+                    edit_source={"id": 52, "type": "source_asset"},
+                    video_transform_mask_asset_id={
+                        "id": 53,
+                        "type": "source_asset",
+                    },
+                    reference_audio={"id": 99, "type": "source_asset"},
+                    audio_control_mode="target_audio",
+                    output_codec="prores",
+                    compression_quality="lossless",
+                ),
+                "u@test.com",
+            )
+            # 4. Video Textures worker
+            _process_vpe_video_textures_in_background(
+                104,
+                CreateVeoDto(
+                    prompt="Seamless ocean waves",
+                    workspace_id=1,
+                    generation_model=GenerationModelEnum.VEO_EXP_VIDEO_TEXTURES,
+                    seamless_loop=True,
+                    tessellate_horizontal=True,
+                    output_codec="prores",
+                ),
+                "u@test.com",
+            )
+            # 5. Upscale worker — SUPER_RES branch
+            _process_vpe_upscale_in_background(
+                105,
+                "gs://ws-bucket/source.mp4",
+                workspace_id=1,
+                upscale_mode="4k_pro",
+                steps=2,
+                seed=7,
+                output_codec="prores",
+                compression_quality="lossless",
+            )
+            # 6. Upscale worker — UPSCALE_SEAMLESS branch (forces prores when h264)
+            _process_vpe_upscale_in_background(
+                106,
+                "gs://ws-bucket/seamless_src.mp4",
+                workspace_id=1,
+                upscale_mode="4k",
+                output_codec="h264",
+                parent_raw_data={
+                    "seamless": {
+                        "loop": True,
+                        "tessellate_horizontal": True,
+                        "tessellate_vertical": False,
+                    }
+                },
+            )
+
+        completed_ids = [
+            uid
+            for uid, data in updates
+            if str(data.get("status", "")).endswith("completed")
+            or "COMPLETED" in str(data.get("status", ""))
+        ]
+        assert {101, 102, 103, 104, 105, 106} <= set(completed_ids)
+        models_sent = [
+            p["parameters"]["experiments"]["modelName"]
+            for p in submitted_payloads
+        ]
+        assert "veo-exp-perf-estimation" in models_sent
+        assert "omni-perf" in models_sent
+        assert "omni-cine" in models_sent
+        assert "veo-exp-video-textures" in models_sent
+        assert "veo-exp-super-res" in models_sent
+        assert "veo3p1_upscale" in models_sent

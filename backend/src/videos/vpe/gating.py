@@ -52,8 +52,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Mapping
 
-from src.videos.vpe.capabilities import VpeCapability
+from src.videos.vpe.capabilities import (
+    VpeCapability,
+    VpeCapabilityId,
+    get_capability,
+)
 from src.videos.vpe.preflight import VpeFinding, VpeReasonCode, VpeSeverity
 
 # Resolution names as stored on the row, in ascending order of long edge.
@@ -67,6 +72,8 @@ _LONG_EDGE_CEILINGS: tuple[tuple[int, str], ...] = (
     (1920, "2K"),
 )
 _LARGEST_NAME = "4K"
+
+DEFAULT_UPSCALE_MODES: tuple[str, ...] = ("1080p", "4k", "4k_pro", "8k")
 
 
 class VpeScreening(str, Enum):
@@ -87,11 +94,14 @@ class VpeScreeningResult:
             out, or lacks the metadata to say.
         findings: Why, in the same vocabulary ``preflight`` uses, so a UI can
             render a screening reason and a preflight reason identically.
+        supported_modes: Target upscale modes worth offering when ``offer`` is
+            True.
     """
 
     capability_id: str
     screening: VpeScreening
     findings: tuple[VpeFinding, ...] = ()
+    supported_modes: tuple[str, ...] = DEFAULT_UPSCALE_MODES
 
     @property
     def offer(self) -> bool:
@@ -102,6 +112,16 @@ class VpeScreeningResult:
         capability that may well work.
         """
         return self.screening is not VpeScreening.RULED_OUT
+
+
+def is_seamless_raw_data(raw_data: Mapping[str, Any] | None) -> bool:
+    """Returns True if a row's raw_data carries active Video Textures flags."""
+    if not isinstance(raw_data, Mapping):
+        return False
+    seamless = raw_data.get("seamless")
+    if isinstance(seamless, Mapping):
+        return any(bool(v) for v in seamless.values())
+    return bool(seamless)
 
 
 def _name_long_edge(long_edge: int) -> str:
@@ -120,23 +140,7 @@ def _name_long_edge(long_edge: int) -> str:
 
 
 def accepted_resolution_names(capability: VpeCapability) -> frozenset[str]:
-    """Names every stored resolution a capability could conceivably accept.
-
-    Derived from the registry's exact frame sizes rather than hardcoded, so
-    a capability whose accepted sizes change does not need editing here.
-
-    Note the widening: two different exact sizes can share a name, and a name
-    covers a range of long edges. 1280x720 and 1920x1080 name as "1K" and
-    "2K", so a 1600x900 clip also names as "2K" and survives screening
-    despite being an illegal input. That is the intended direction of error.
-
-    Args:
-        capability: The capability whose video constraints to read.
-
-    Returns:
-        The stored resolution names that do not rule the capability out.
-        Empty if the capability takes no video at all.
-    """
+    """Names every stored resolution a capability could conceivably accept."""
     constraints = capability.input_video
     if constraints is None:
         return frozenset()
@@ -152,24 +156,9 @@ def screen_stored_video(
     duration_seconds: float | None,
     resolution: str | None,
     max_segments: int = 1,
+    supported_modes: tuple[str, ...] = DEFAULT_UPSCALE_MODES,
 ) -> VpeScreeningResult:
-    """Screens a stored video row against a capability's input rules.
-
-    Args:
-        capability: The capability to screen against.
-        duration_seconds: The row's measured duration, or None if unmeasured.
-        resolution: The row's stored resolution name, or None if unmeasured.
-        max_segments: How many pieces a caller can split this clip into
-            before running it, widening the duration ceiling by that many
-            multiples of the capability's own maximum. Left at 1 - no
-            splitting credit - for any capability that has no split-and-
-            rejoin worker behind it, which is every capability but the
-            upscaler today. A short clip gets no such credit either way:
-            no number of pieces makes a clip longer.
-
-    Returns:
-        The screening outcome and the findings behind it.
-    """
+    """Screens a stored video row against a capability's input rules."""
     capability_id = str(capability.capability_id)
     constraints = capability.input_video
     if constraints is None:
@@ -186,22 +175,19 @@ def screen_stored_video(
                     measured="video",
                 ),
             ),
+            supported_modes=(),
         )
 
     if duration_seconds is None and resolution is None:
         return VpeScreeningResult(
             capability_id=capability_id,
             screening=VpeScreening.UNKNOWN,
+            supported_modes=supported_modes,
         )
 
     findings: list[VpeFinding] = []
 
     if duration_seconds is not None:
-        # Half a frame of slack on each end. The bounds are frame counts and
-        # the stored value is a float division, so a clip sitting exactly on
-        # 192 frames can land a hair under 8.0 and must not be rejected for
-        # a rounding artefact. Anything within half a frame of legal is left
-        # for preflight to count exactly.
         slack = 0.5 / constraints.fps
         max_span = constraints.max_seconds * max_segments
         window = (
@@ -225,11 +211,6 @@ def screen_stored_video(
                         f"{capability.label} accepts {window},"
                         f" and this one is {duration_seconds:g} seconds."
                     ),
-                    # A long clip has a way out and a short one does not, so
-                    # they get different advice rather than one hedged line -
-                    # unless splitting is already priced into the window
-                    # above and still is not enough, in which case there is
-                    # nothing left to suggest.
                     remedy=(
                         "Split the clip into segments inside the window."
                         if too_long and max_segments <= 1
@@ -262,12 +243,96 @@ def screen_stored_video(
             capability_id=capability_id,
             screening=VpeScreening.RULED_OUT,
             findings=tuple(findings),
+            supported_modes=(),
         )
 
-    # Survived every check the row can answer. That is not the same as
-    # passing: frame rate was never examined, and the frame size was checked
-    # by name rather than by pixels.
     return VpeScreeningResult(
         capability_id=capability_id,
         screening=VpeScreening.NOT_RULED_OUT,
+        supported_modes=supported_modes,
+    )
+
+
+def screen_upscale_candidate(
+    *,
+    duration_seconds: float | None,
+    resolution: str | None,
+    raw_data: Mapping[str, Any] | None = None,
+    max_segments: int = 1,
+    capability_id: VpeCapabilityId = VpeCapabilityId.UPSCALE,
+) -> VpeScreeningResult:
+    """Screens a gallery row across GMP Super Resolution and Veo Upscaler.
+
+    - Seamless Video Texture clips (``raw_data["seamless"]``) offer ``["4k"]``.
+    - 4K clips (``resolution == "4K"``) offer ``["8k"]`` via ``SUPER_RES``
+      ``MODE_8K`` (up to 240 frames / 10s).
+    - 720p / 1080p clips (``"1K"``, ``"2K"``, ``"720p"``, ``"1080p"``, or
+      unmeasured) offer ``["1080p", "4k", "4k_pro", "8k"]`` (up to 10s via
+      ``SUPER_RES`` or longer via segmented ``veo3p1_upscale``).
+    """
+    reported_id = str(capability_id)
+    normalized_res = (
+        {"720p": "1K", "1080p": "2K"}.get(resolution, resolution)
+        if resolution
+        else None
+    )
+
+    if is_seamless_raw_data(raw_data):
+        res = screen_stored_video(
+            get_capability(VpeCapabilityId.UPSCALE_SEAMLESS),
+            duration_seconds=duration_seconds,
+            resolution=normalized_res,
+            max_segments=1,
+            supported_modes=("4k",),
+        )
+        return VpeScreeningResult(
+            capability_id=reported_id,
+            screening=res.screening,
+            findings=res.findings,
+            supported_modes=res.supported_modes,
+        )
+
+    if normalized_res == "4K":
+        res = screen_stored_video(
+            get_capability(VpeCapabilityId.SUPER_RES),
+            duration_seconds=duration_seconds,
+            resolution="4K",
+            max_segments=1,
+            supported_modes=("8k",),
+        )
+        return VpeScreeningResult(
+            capability_id=reported_id,
+            screening=res.screening,
+            findings=res.findings,
+            supported_modes=res.supported_modes,
+        )
+
+    # Short clips (< 4s) are eligible for 1..240-frame SUPER_RES (4k/4k_pro/8k)
+    super_res_cap = get_capability(VpeCapabilityId.SUPER_RES)
+    upscale_cap = get_capability(VpeCapabilityId.UPSCALE)
+    slack = 0.5 / upscale_cap.input_video.fps
+    if (
+        duration_seconds is not None
+        and duration_seconds < upscale_cap.input_video.min_seconds - slack
+    ):
+        res = screen_stored_video(
+            super_res_cap,
+            duration_seconds=duration_seconds,
+            resolution=normalized_res,
+            max_segments=1,
+            supported_modes=("4k", "4k_pro", "8k"),
+        )
+        return VpeScreeningResult(
+            capability_id=reported_id,
+            screening=res.screening,
+            findings=res.findings,
+            supported_modes=res.supported_modes,
+        )
+
+    return screen_stored_video(
+        upscale_cap,
+        duration_seconds=duration_seconds,
+        resolution=normalized_res,
+        max_segments=max_segments,
+        supported_modes=DEFAULT_UPSCALE_MODES,
     )

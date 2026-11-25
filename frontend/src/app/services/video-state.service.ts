@@ -61,6 +61,18 @@ interface VideoState {
   transformStrength?: number;
   seed?: number | null;
   numDiffusionSteps?: number;
+  outputCodec?: 'h264' | 'prores' | 'dnxhr';
+  compressionQuality?: 'optimized' | 'lossless';
+  audioControlMode?:
+    | 'generate'
+    | 'preserve_video_audio'
+    | 'target_audio'
+    | 'reference_audio'
+    | null;
+  isBlueMeshInput?: boolean;
+  seamlessLoop?: boolean;
+  tessellateHorizontal?: boolean;
+  tessellateVertical?: boolean;
 }
 
 @Injectable({
@@ -99,6 +111,13 @@ export class VideoStateService {
       transformStrength: 0.5,
       seed: null,
       numDiffusionSteps: 20,
+      outputCodec: 'h264',
+      compressionQuality: 'optimized',
+      audioControlMode: null,
+      isBlueMeshInput: false,
+      seamlessLoop: true,
+      tessellateHorizontal: false,
+      tessellateVertical: false,
     };
 
     let savedState: VideoState | null = null;
@@ -210,6 +229,13 @@ export class VideoStateService {
               transformStrength: parsed.transformStrength ?? 0.5,
               seed: parsed.seed ?? null,
               numDiffusionSteps: parsed.numDiffusionSteps ?? 20,
+              outputCodec: parsed.outputCodec ?? 'h264',
+              compressionQuality: parsed.compressionQuality ?? 'optimized',
+              audioControlMode: parsed.audioControlMode ?? null,
+              isBlueMeshInput: parsed.isBlueMeshInput ?? false,
+              seamlessLoop: parsed.seamlessLoop ?? true,
+              tessellateHorizontal: parsed.tessellateHorizontal ?? false,
+              tessellateVertical: parsed.tessellateVertical ?? false,
             };
           }
         }

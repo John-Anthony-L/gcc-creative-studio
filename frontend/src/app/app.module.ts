@@ -107,6 +107,7 @@ import {WorkflowEditorComponent} from './workflows/workflow-editor/workflow-edit
 import {WorkflowListComponent} from './workflows/workflow-list/workflow-list.component';
 import {WorkflowStatusPipe} from './workflows/workflow-status.pipe';
 import {UpscaleComponent} from './upscale/upscale.component';
+import {GmpStudioComponent} from './gmp-studio/gmp-studio.component';
 import {SafeUrlPipe} from './common/pipes/safe-url.pipe';
 
 @NgModule({
@@ -141,6 +142,7 @@ import {SafeUrlPipe} from './common/pipes/safe-url.pipe';
     StepExecutionDetailsComponent,
     BatchExecutionModalComponent,
     UpscaleComponent,
+    GmpStudioComponent,
   ],
   imports: [
     BrowserModule,

@@ -751,3 +751,45 @@ async def test_enrich_youtube_source_asset_and_unified_item(service):
     assert enriched.presigned_thumbnail_urls == [
         "https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
     ]
+
+
+@pytest.mark.anyio
+async def test_master_presigned_urls_populated_for_prores_and_dnxhr(service):
+    service.mock_iam_signer.generate_presigned_url.side_effect = (
+        lambda uri: f"https://signed.test/{uri}"
+    )
+    item = MediaItemModel(
+        id=77,
+        workspace_id=1,
+        user_email="pro@test.com",
+        mime_type=MimeTypeEnum.VIDEO_MP4,
+        model=GenerationModelEnum.OMNI_CINE,
+        aspect_ratio=AspectRatioEnum.RATIO_16_9,
+        status=JobStatusEnum.COMPLETED,
+        gcs_uris=["gs://bucket/preview.mp4"],
+        thumbnail_uris=["gs://bucket/thumb.png"],
+        raw_data={
+            "output_codec": "prores",
+            "compression_quality": "lossless",
+            "master_gcs_uris": ["gs://bucket/master.mov"],
+        },
+    )
+    resp = await service._create_gallery_response(item)
+    assert resp.master_presigned_urls == [
+        "https://signed.test/gs://bucket/master.mov"
+    ]
+
+    unified = UnifiedGalleryItemResponse(
+        id=77,
+        workspace_id=1,
+        created_at=datetime.now(),
+        item_type="media_item",
+        status="completed",
+        gcs_uris=["gs://bucket/preview.mp4"],
+        thumbnail_uris=[],
+        metadata_={"master_gcs_uris": ["gs://bucket/master.mxf"]},
+    )
+    enriched_u = await service._enrich_unified_item(unified)
+    assert enriched_u.master_presigned_urls == [
+        "https://signed.test/gs://bucket/master.mxf"
+    ]

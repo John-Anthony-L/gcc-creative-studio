@@ -80,16 +80,15 @@ export class UpscaleComponent implements OnInit, OnDestroy {
     public matIconRegistry: MatIconRegistry,
     private sanitizer: DomSanitizer,
   ) {
+    const iconPath = 'assets/images';
     this.matIconRegistry.addSvgIcon(
       'mobile-white-gemini-spark-icon',
-      this.setPath(`${this.path}/mobile-white-gemini-spark-icon.svg`),
+      this.setPath(`${iconPath}/mobile-white-gemini-spark-icon.svg`),
     );
 
     // Initialize the combined job stream
     this.activeUpscaleJob$ = this.sourceAssetService.activeUpscaleJob$;
   }
-
-  private path = '../../assets/images';
 
   private setPath(url: string): SafeResourceUrl {
     return this.sanitizer.bypassSecurityTrustResourceUrl(url);

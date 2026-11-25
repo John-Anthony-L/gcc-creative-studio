@@ -11,50 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Creative Studio's integration of Veo Pro Experimental.
+"""Creative Studio's integration of Generative Media Pro / Veo Pro Experimental.
 
 ``src/videos/vpe/`` is a pure library: it knows the API and nothing about
-this application. This module is the other half - it owns the gallery row,
-the buckets, the temporary files and the background thread, and it sits
-beside ``veo_service`` rather than inside the package so the package stays
-importable and inert on a deployment where VPE is switched off.
-
-Only the upscaler is wired up. It is the capability with a live measured
-result behind it and the one the customer asked for.
-
-Three things about the shape of this worker are not obvious:
-
-**It splits.** The upscaler takes 4 to 8 seconds and production shots are 9
-or 10, so a full-length master only exists if the clip is cut up, upscaled
-in pieces and rejoined. That the rejoin is invisible was measured on real
-footage rather than assumed; see section 6g of the integration plan.
-
-**It submits every segment before waiting for any.** Submission is cheap and
-the wait is minutes, so submitting first lets the service run the pieces
-concurrently, and it puts every operation name on the row before this worker
-blocks on anything - which is what makes a job survive the process dying.
-
-**It crosses projects.** VPE reads and writes its own bucket inside the
-allowlisted project, which is not the project holding ``GENMEDIA_BUCKET``.
-Video therefore comes down out of one bucket and goes up into another rather
-than being handed over by URI.
+this application. This module owns the gallery row, the buckets, the temporary
+files and the background workers for Super Resolution, Seamless Upscaling,
+Segmented Upscaling, Dialogue-Driven generation, Video Transform, Performance
+Estimation, Omni-Perf, Omni-Cine, and Video Textures.
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
+from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import Depends, HTTPException
 from google.cloud.logging import Client as LoggerClient
 from google.cloud.logging.handlers import CloudLoggingHandler
 
+from src.auth.iam_signer_credentials_service import IamSignerCredentials
 from src.common.base_dto import (
     AspectRatioEnum,
     GenerationModelEnum,
@@ -67,8 +49,6 @@ from src.common.schema.media_item_model import (
     MediaItemModel,
     SourceMediaItemLink,
 )
-import subprocess
-from src.auth.iam_signer_credentials_service import IamSignerCredentials
 from src.common.storage_service import GcsService
 from src.config.config_service import ConfigService, config_service
 from src.database import WorkerDatabase
@@ -85,26 +65,54 @@ from src.videos.veo_service import (
     record_worker_progress,
 )
 from src.videos.vpe.capabilities import (
+    MIME_JPEG,
+    MIME_MP3,
+    MIME_MP4,
+    MIME_MPEG,
+    MIME_MXF,
+    MIME_PNG,
+    MIME_QUICKTIME,
+    MIME_WAV,
+    MIME_WEBP,
+    SUPER_RES_4K_INPUT_SIZES,
     VpeCapabilityId,
+    VpeSuperResMode,
     VpeUpscaleResolution,
     get_capability,
 )
-from src.videos.vpe.client import VpeClient, parse_result
-from src.videos.vpe.gating import VpeScreeningResult, screen_stored_video
+from src.videos.vpe.client import (
+    VpeClient,
+    VpeOperation,
+    VpeResult,
+    parse_result,
+)
+from src.videos.vpe.gating import (
+    VpeScreeningResult,
+    is_seamless_raw_data,
+    screen_stored_video,
+    screen_upscale_candidate,
+)
 from src.videos.vpe.media_ops import (
     concat_segments,
     cut_segment,
+    extract_audio_wav,
+    has_audio_stream,
+    normalize_video_720p_24fps,
     postprocess_dialogue_video,
     postprocess_transform_video,
     prepare_dialogue_audio,
     prepare_dialogue_frame,
     prepare_transform_video,
     restore_audio,
+    transcode_to_h264_preview,
 )
 from src.videos.vpe.payloads import (
+    VpeAudioControl,
     VpeConditioningFrame,
     VpeMediaRef,
+    VpeOmniVideoTransform,
     VpeRequest,
+    VpeSeamlessFlags,
     build_payload,
 )
 from src.videos.vpe.preflight import (
@@ -120,15 +128,7 @@ logger = logging.getLogger(__name__)
 
 _MP4 = MimeTypeEnum.VIDEO_MP4.value
 
-# Per segment, not per job. A 4K upscale of an 8 second clip was measured at
-# around 315 seconds, and the ceiling has to leave room for a queue in front
-# of it, so this is deliberately far above the observed time: hitting it
-# should mean something is wrong, not that the service was busy.
 SEGMENT_TIMEOUT_SECONDS = 1800.0
-
-# A clip long enough to need this many pieces is not a shot. Splitting it
-# would mean dozens of paid jobs and dozens of seams, and the request is
-# much more likely to be a whole edit submitted by mistake.
 MAX_SEGMENTS_PER_JOB = 8
 
 _SEGMENTABLE_CODES = frozenset(
@@ -138,9 +138,15 @@ _SEGMENTABLE_CODES = frozenset(
     },
 )
 
+_SUPER_RES_MODE_MAP: dict[str, str] = {
+    "4k": VpeSuperResMode.MODE_4K.value,
+    "4k_pro": VpeSuperResMode.MODE_4K_PRO.value,
+    "8k": VpeSuperResMode.MODE_8K.value,
+}
+
 
 class VpeJobError(RuntimeError):
-    """Raised when an upscale cannot be run as requested."""
+    """Raised when a VPE / GMP job cannot be run as requested."""
 
 
 def _uri_bucket_name(gcs_uri: str) -> str | None:
@@ -150,6 +156,13 @@ def _uri_bucket_name(gcs_uri: str) -> str | None:
     without_scheme = gcs_uri.removeprefix("gs://")
     bucket, sep, _ = without_scheme.partition("/")
     return bucket if (bucket and sep) else None
+
+
+def _blob_path(gcs_uri: str) -> str:
+    """Strips a gs:// URI down to the object path within its bucket."""
+    without_scheme = gcs_uri.removeprefix("gs://")
+    _, _, path = without_scheme.partition("/")
+    return path
 
 
 async def _resolve_workspace_gcs_config(
@@ -263,31 +276,12 @@ async def _download_asset_gcs(
 
 
 def aspect_ratio_for(probe: VpeMediaProbe) -> str:
-    """Returns the aspect ratio to declare for a measured clip.
-
-    The upscaler accepts ``16:9`` and ``9:16`` only, and rejects a declared
-    ratio that disagrees with the pixels. Anything that is neither has
-    already been refused by the frame-size check, so orientation is enough
-    to choose between the two.
-
-    Args:
-        probe: A measurement of the source clip.
-
-    Returns:
-        The aspect ratio string to send.
-    """
+    """Returns the aspect ratio ('9:16' or '16:9') for a measured clip."""
     return "9:16" if probe.is_portrait else "16:9"
 
 
 def check_upscalable(probe: VpeMediaProbe) -> None:
-    """Refuses a source the upscaler cannot be made to accept.
-
-    Args:
-        probe: A measurement of the source clip.
-
-    Raises:
-        VpeJobError: If the clip breaks a rule splitting cannot fix.
-    """
+    """Refuses a source the segmented upscaler cannot be made to accept."""
     verdict = validate(probe, VpeCapabilityId.UPSCALE)
     fatal = [
         finding
@@ -298,20 +292,27 @@ def check_upscalable(probe: VpeMediaProbe) -> None:
         raise VpeJobError(" ".join(finding.message for finding in fatal))
 
 
+def check_super_res_upscalable(
+    probe: VpeMediaProbe,
+    super_res_mode: str,
+) -> None:
+    """Validates a probed source clip against GMP Super Resolution rules."""
+    verdict = validate(probe, VpeCapabilityId.SUPER_RES)
+    if verdict.blocking:
+        raise VpeJobError(
+            " ".join(finding.message for finding in verdict.blocking)
+        )
+    if (
+        probe.frame_size in SUPER_RES_4K_INPUT_SIZES
+        and super_res_mode != VpeSuperResMode.MODE_8K.value
+    ):
+        raise VpeJobError(
+            "4K input videos are supported only with MODE_8K (8K output)."
+        )
+
+
 def plan_upscale(probe: VpeMediaProbe) -> tuple[VpeSegment, ...]:
-    """Decides how a measured clip is divided for upscaling.
-
-    Args:
-        probe: A measurement of the source clip.
-
-    Returns:
-        The segments to upscale, one of them the whole clip if it already
-        fits the window.
-
-    Raises:
-        VpeJobError: If the clip cannot be measured or would need more
-            segments than a single shot plausibly should.
-    """
+    """Decides how a measured clip is divided for segmented upscaling."""
     if not probe.frame_count:
         raise VpeJobError(
             "The source clip's frames could not be counted, and the"
@@ -336,19 +337,10 @@ def build_segment_request(
     aspect_ratio: str,
     resolution: VpeUpscaleResolution,
     sharpness: int | None,
+    codec: str | None = None,
+    compression_quality: str | None = None,
 ) -> VpeRequest:
-    """Builds the upscale request for one already-uploaded segment.
-
-    Args:
-        segment_uri: Where the segment was uploaded, in VPE's bucket.
-        storage_uri: The folder VPE should write this segment's output into.
-        aspect_ratio: The measured ratio, which must match the pixels.
-        resolution: Target resolution.
-        sharpness: Sharpening strength, or None to leave it to the model.
-
-    Returns:
-        The request to hand to ``build_payload``.
-    """
+    """Builds the upscale request for one already-uploaded segment."""
     return VpeRequest(
         capability_id=VpeCapabilityId.UPSCALE,
         storage_uri=storage_uri,
@@ -356,22 +348,13 @@ def build_segment_request(
         resolution=resolution.value,
         aspect_ratio=aspect_ratio,
         sharpness=sharpness,
+        codec=codec,
+        compression_quality=compression_quality,
     )
 
 
 def require_vpe_configured(cfg: ConfigService) -> None:
-    """Refuses a job on a deployment that cannot run one.
-
-    Failing here costs nothing. The same misconfiguration found later fails
-    several minutes into a job, after a download and a cut.
-
-    Args:
-        cfg: The settings to check.
-
-    Raises:
-        VpeJobError: If VPE is disabled, or has no bucket or project of its
-            own.
-    """
+    """Refuses a job on a deployment that cannot run one."""
     if not cfg.VPE_ENABLED:
         raise VpeJobError("VPE is not enabled on this deployment.")
     if not cfg.VPE_BUCKET:
@@ -387,69 +370,563 @@ def require_vpe_configured(cfg: ConfigService) -> None:
         )
 
 
-def _worker_logger(media_item_id: int) -> logging.Logger:
-    """Builds the per-job logger, matching the other video workers.
-
-    Args:
-        media_item_id: The job whose logger this is.
-
-    Returns:
-        A configured logger writing to Cloud Logging in production.
-    """
-    worker_logger = logging.getLogger(f"vpe_upscale_worker.{media_item_id}")
+def _worker_logger(
+    media_item_id: int,
+    worker_tag: str = "upscale",
+) -> logging.Logger:
+    """Builds the per-job logger, matching the other video workers."""
+    name = f"vpe_{worker_tag}_worker.{media_item_id}"
+    worker_logger = logging.getLogger(name)
     worker_logger.setLevel(logging.INFO)
     if worker_logger.hasHandlers():
         worker_logger.handlers.clear()
 
     if os.getenv("ENVIRONMENT") == "production":
-        handler = CloudLoggingHandler(
-            LoggerClient(),
-            name=f"vpe_upscale_worker.{media_item_id}",
-        )
+        handler = CloudLoggingHandler(LoggerClient(), name=name)
     else:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(
             logging.Formatter(
-                "%(asctime)s - [VPE_UPSCALE_WORKER] - %(levelname)s -"
-                " %(message)s",
+                f"%(asctime)s - [VPE_{worker_tag.upper()}_WORKER] -"
+                " %(levelname)s - %(message)s",
             ),
         )
     worker_logger.addHandler(handler)
     return worker_logger
 
 
-def _blob_path(gcs_uri: str) -> str:
-    """Strips a gs:// URI down to the object path within its bucket.
+def _discard_segments(
+    vpe_gcs: GcsService,
+    uris: list[str],
+    worker_logger: logging.Logger,
+) -> None:
+    """Deletes intermediate files uploaded for one job on a best-effort basis."""
+    for uri in uris:
+        try:
+            vpe_gcs.delete_blob_from_uri(uri)
+        except Exception as error:  # noqa: BLE001
+            worker_logger.warning("Could not delete %s: %s", uri, error)
 
-    Args:
-        gcs_uri: A full ``gs://bucket/path`` URI.
 
-    Returns:
-        The object path, without the bucket.
+def _is_retryable_vpe_error(err: Exception) -> bool:
+    """Returns True if an exception indicates transient capacity/overload."""
+    text = str(err).lower()
+    return bool(getattr(err, "retryable", False)) or any(
+        tok in text
+        for tok in (
+            "unavailable",
+            "overloaded",
+            "resource exhausted",
+            "high load",
+            "capacity",
+            "429",
+            "503",
+        )
+    )
+
+
+async def _poll_operation_until_done(
+    client: VpeClient,
+    operation: VpeOperation,
+    media_repo: MediaRepository,
+    media_item_id: int,
+    worker_logger: logging.Logger,
+    *,
+    max_wait: float = SEGMENT_TIMEOUT_SECONDS,
+    poll_interval: float = 10.0,
+) -> VpeResult:
+    """Polls a VPE long-running operation until completion."""
+    if operation.done:
+        if operation.has_error:
+            err_info = operation.raw.get("error") or {}
+            raise VpeJobError(
+                f"VPE operation failed: {err_info.get('message', err_info)}"
+            )
+        return parse_result(operation)
+
+    poll_res = operation
+    total_wait = 0.0
+    transient_failures = 0
+    max_transient = 6
+
+    while not poll_res.done and total_wait < max_wait:
+        await asyncio.sleep(poll_interval)
+        total_wait += poll_interval
+        try:
+            poll_res = await asyncio.to_thread(client.poll, operation.name)
+            transient_failures = 0
+        except Exception as poll_err:  # noqa: BLE001
+            if _is_retryable_vpe_error(poll_err):
+                transient_failures += 1
+                worker_logger.warning(
+                    "Transient poll error on %s (%d/%d): %s",
+                    operation.name,
+                    transient_failures,
+                    max_transient,
+                    poll_err,
+                )
+                if transient_failures > max_transient:
+                    raise
+                continue
+            raise
+
+        await record_worker_progress(media_repo, media_item_id, worker_logger)
+
+    if not poll_res.done:
+        raise VpeJobError(
+            f"VPE operation {operation.name} timed out after {total_wait:.1f}s."
+        )
+    if poll_res.has_error:
+        err_info = poll_res.raw.get("error") or {}
+        raise VpeJobError(
+            f"VPE operation failed: {err_info.get('message', err_info)}"
+        )
+    return parse_result(poll_res)
+
+
+async def _submit_and_wait_with_retry(
+    client: VpeClient,
+    request: VpeRequest,
+    media_repo: MediaRepository,
+    media_item_id: int,
+    worker_logger: logging.Logger,
+    *,
+    base_raw_data: dict[str, Any] | None = None,
+    max_retries: int = 3,
+) -> tuple[VpeResult, str]:
+    """Submits a VpeRequest and polls with automatic retry on capacity errors."""
+    payload = build_payload(request)
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            operation = await asyncio.to_thread(client.submit, payload)
+            raw_record = {
+                **(base_raw_data or {}),
+                "vpe_capability": request.capability_id.value,
+                "vpe_operation": operation.name,
+            }
+            await record_worker_progress(
+                media_repo,
+                media_item_id,
+                worker_logger,
+                {"raw_data": raw_record},
+            )
+            result = await _poll_operation_until_done(
+                client,
+                operation,
+                media_repo,
+                media_item_id,
+                worker_logger,
+            )
+            return result, operation.name
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            if _is_retryable_vpe_error(err) and attempt < max_retries - 1:
+                backoff = (attempt + 1) * 15
+                worker_logger.warning(
+                    "VPE job %s failed with retryable error (%s). Retrying in"
+                    " %ds (attempt %d/%d)...",
+                    media_item_id,
+                    err,
+                    backoff,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            raise
+    raise VpeJobError(f"VPE job failed: {last_err}")  # pragma: no cover
+
+
+def _detect_gmp_delivery_format(
+    primary_uri: str,
+    primary_mime: str,
+    requested_codec: str | None,
+) -> tuple[str, str, str]:
+    """Returns (file_ext, mime_type, codec) for a GMP output video."""
+    lower_uri = (primary_uri or "").lower()
+    lower_mime = (primary_mime or "").lower()
+    req_codec = (requested_codec or "h264").lower()
+
+    if (
+        lower_uri.endswith(".mov")
+        or lower_mime == MIME_QUICKTIME
+        or req_codec == "prores"
+    ):
+        return "mov", MIME_QUICKTIME, "prores"
+    if (
+        lower_uri.endswith(".mxf")
+        or lower_mime == MIME_MXF
+        or req_codec == "dnxhr"
+    ):
+        return "mxf", MIME_MXF, "dnxhr"
+    return "mp4", MIME_MP4, "h264"
+
+
+async def _deliver_gmp_output(
+    *,
+    result: VpeResult,
+    output_codec: str | None,
+    compression_quality: str | None,
+    dest_prefix: str,
+    work: Path,
+    vpe_gcs: GcsService,
+    app_gcs: GcsService,
+    base_raw_data: dict[str, Any] | None = None,
+    audio_restore_source: Path | None = None,
+    preview_postprocess_fn: Callable[[Path, Path], Path] | None = None,
+) -> dict[str, Any]:
+    """Downloads GMP output and handles Dual-Asset ProRes/DNxHR Master delivery.
+
+    Whenever the output is ``.mov`` (``prores``) or ``.mxf`` (``dnxhr``), the
+    master file is uploaded to ``app_gcs`` and recorded under
+    ``raw_data["master_gcs_uris"]``, while a web-playable H.264 ``.mp4`` is
+    transcoded via ``transcode_to_h264_preview`` for ``gcs_uris``.
     """
-    without_scheme = gcs_uri.removeprefix("gs://")
-    _, _, path = without_scheme.partition("/")
-    return path
+    if not result.primary_video:
+        raise VpeJobError("GMP operation finished without an output video.")
+
+    primary_uri = result.primary_video.gcs_uri
+    primary_mime = result.primary_video.mime_type
+    ext, master_mime, resolved_codec = _detect_gmp_delivery_format(
+        primary_uri,
+        primary_mime,
+        output_codec,
+    )
+    resolved_quality = compression_quality or "optimized"
+
+    local_raw = work / f"gmp_output.{ext}"
+    fetched = await asyncio.to_thread(
+        vpe_gcs.download_from_gcs,
+        gcs_uri_path=_blob_path(primary_uri),
+        destination_file_path=str(local_raw),
+    )
+    if not fetched:
+        raise VpeJobError(f"Could not download GMP output from {primary_uri}.")
+
+    raw_data: dict[str, Any] = {
+        **(base_raw_data or {}),
+        "output_codec": resolved_codec,
+        "compression_quality": resolved_quality,
+    }
+
+    if resolved_codec in ("prores", "dnxhr"):
+        master_blob = f"{dest_prefix}_master.{ext}"
+        master_gcs_uri = await asyncio.to_thread(
+            app_gcs.upload_file_to_gcs,
+            local_path=str(local_raw),
+            destination_blob_name=master_blob,
+            mime_type=master_mime,
+        )
+        if not master_gcs_uri:
+            raise VpeJobError("Could not upload professional master asset.")
+        raw_data["master_gcs_uris"] = [master_gcs_uri]
+
+        local_preview = work / "preview_h264.mp4"
+        await asyncio.to_thread(
+            transcode_to_h264_preview,
+            local_raw,
+            local_preview,
+        )
+        candidate_mp4 = local_preview
+    else:
+        candidate_mp4 = local_raw
+
+    if preview_postprocess_fn is not None:
+        post_mp4 = work / "preview_post.mp4"
+        candidate_mp4 = await asyncio.to_thread(
+            preview_postprocess_fn,
+            candidate_mp4,
+            post_mp4,
+        )
+
+    if audio_restore_source is not None:
+        has_out_audio = await asyncio.to_thread(has_audio_stream, candidate_mp4)
+        if not has_out_audio:
+            restored_mp4 = work / "preview_with_audio.mp4"
+            candidate_mp4 = await asyncio.to_thread(
+                restore_audio,
+                candidate_mp4,
+                audio_restore_source,
+                restored_mp4,
+            )
+
+    preview_blob = f"{dest_prefix}.mp4"
+    preview_gcs_uri = await asyncio.to_thread(
+        app_gcs.upload_file_to_gcs,
+        local_path=str(candidate_mp4),
+        destination_blob_name=preview_blob,
+        mime_type=_MP4,
+    )
+    if not preview_gcs_uri:
+        raise VpeJobError("Could not upload preview MP4 asset.")
+
+    thumb_path = await asyncio.to_thread(
+        generate_thumbnail,
+        str(candidate_mp4),
+    )
+    thumb_gcs_uri = None
+    if thumb_path:
+        thumb_gcs_uri = await asyncio.to_thread(
+            app_gcs.upload_file_to_gcs,
+            local_path=thumb_path,
+            destination_blob_name=f"{dest_prefix}_thumb.png",
+            mime_type="image/png",
+        )
+
+    measured_target = (
+        local_raw
+        if resolved_codec in ("prores", "dnxhr")
+        and preview_postprocess_fn is None
+        else candidate_mp4
+    )
+    measured_metadata = await asyncio.to_thread(
+        build_measured_metadata,
+        str(measured_target),
+    )
+
+    return {
+        "gcs_uris": [preview_gcs_uri],
+        "thumbnail_uris": [thumb_gcs_uri] if thumb_gcs_uri else [],
+        "raw_data": raw_data,
+        **measured_metadata,
+    }
+
+
+def _guess_image_mime_and_ext(uri: str) -> tuple[str, str]:
+    """Guesses wire mime type and file extension for an image URI."""
+    lower = uri.lower()
+    if lower.endswith(".webp"):
+        return MIME_WEBP, "webp"
+    if lower.endswith((".jpg", ".jpeg")):
+        return MIME_JPEG, "jpg"
+    return MIME_PNG, "png"
+
+
+def _guess_audio_mime_and_ext(uri: str) -> tuple[str, str]:
+    """Guesses wire mime type and file extension for an audio URI."""
+    lower = uri.lower()
+    if lower.endswith(".mp3"):
+        return MIME_MP3, "mp3"
+    if lower.endswith(".mpeg"):
+        return MIME_MPEG, "mpeg"
+    return MIME_WAV, "wav"
+
+
+async def _stage_single_image(
+    *,
+    uri: str,
+    slot_name: str,
+    prefix: str,
+    work: Path,
+    app_gcs: GcsService,
+    vpe_gcs: GcsService,
+    fallback_project_id: str | None,
+) -> VpeMediaRef:
+    """Downloads an image URI and stages it into the VPE bucket."""
+    mime_type, ext = _guess_image_mime_and_ext(uri)
+    local_img = work / f"{slot_name}.{ext}"
+    downloaded = await _download_asset_gcs(
+        uri,
+        local_img,
+        app_gcs,
+        vpe_gcs,
+        fallback_project_id=fallback_project_id,
+    )
+    if not downloaded:
+        raise VpeJobError(f"Could not download image {uri}.")
+    staged_uri = await asyncio.to_thread(
+        vpe_gcs.upload_file_to_gcs,
+        local_path=str(local_img),
+        destination_blob_name=f"{prefix}/{slot_name}.{ext}",
+        mime_type=mime_type,
+    )
+    if not staged_uri:
+        raise VpeJobError(f"Could not stage image {slot_name} to VPE bucket.")
+    return VpeMediaRef(gcs_uri=staged_uri, mime_type=mime_type)
+
+
+async def _collect_and_stage_reference_images(
+    *,
+    request_dto: CreateVeoDto,
+    prefix: str,
+    work: Path,
+    media_repo: MediaRepository,
+    source_asset_repo: SourceAssetRepository,
+    app_gcs: GcsService,
+    vpe_gcs: GcsService,
+    fallback_project_id: str | None,
+    max_items: int,
+) -> tuple[VpeMediaRef, ...]:
+    """Resolves and stages reference_images and image source_media_items."""
+    uris: list[str] = []
+    if request_dto.reference_images:
+        for ref_img in request_dto.reference_images:
+            asset = await source_asset_repo.get_by_id(ref_img.asset_id)
+            if asset and asset.gcs_uri:
+                uris.append(asset.gcs_uri)
+    if request_dto.source_media_items:
+        for smi in request_dto.source_media_items:
+            if smi.role in {
+                AssetRoleEnum.IMAGE_REFERENCE_ASSET,
+                AssetRoleEnum.IMAGE_REFERENCE_STYLE,
+            }:
+                parent_item = await media_repo.get_by_id(smi.media_item_id)
+                if (
+                    parent_item
+                    and parent_item.gcs_uris
+                    and 0 <= smi.media_index < len(parent_item.gcs_uris)
+                ):
+                    uris.append(parent_item.gcs_uris[smi.media_index])
+
+    uris = uris[:max_items]
+    staged: list[VpeMediaRef] = []
+    for idx, uri in enumerate(uris):
+        staged.append(
+            await _stage_single_image(
+                uri=uri,
+                slot_name=f"ref_img_{idx:02d}",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=fallback_project_id,
+            )
+        )
+    return tuple(staged)
+
+
+async def _resolve_audio_uris(
+    request_dto: CreateVeoDto,
+    media_repo: MediaRepository,
+    source_asset_repo: SourceAssetRepository,
+    max_items: int = 3,
+) -> list[str]:
+    """Resolves audio GCS URIs from reference_audio and source_media_items."""
+    uris: list[str] = []
+    if request_dto.reference_audio:
+        uri = await _resolve_asset_ref_uri(
+            request_dto.reference_audio,
+            media_repo,
+            source_asset_repo,
+        )
+        if uri:
+            uris.append(uri)
+    if request_dto.source_media_items:
+        for smi in request_dto.source_media_items:
+            if smi.role == AssetRoleEnum.AUDIO_REFERENCE:
+                parent_item = await media_repo.get_by_id(smi.media_item_id)
+                if (
+                    parent_item
+                    and parent_item.gcs_uris
+                    and 0 <= smi.media_index < len(parent_item.gcs_uris)
+                ):
+                    uris.append(parent_item.gcs_uris[smi.media_index])
+    return uris[:max_items]
+
+
+async def _stage_audio_file(
+    *,
+    uri: str,
+    slot_name: str,
+    prefix: str,
+    work: Path,
+    app_gcs: GcsService,
+    vpe_gcs: GcsService,
+    fallback_project_id: str | None,
+) -> VpeMediaRef:
+    """Downloads an audio file and stages it into VPE's bucket."""
+    mime_type, ext = _guess_audio_mime_and_ext(uri)
+    local_audio = work / f"{slot_name}_raw.{ext}"
+    downloaded = await _download_asset_gcs(
+        uri,
+        local_audio,
+        app_gcs,
+        vpe_gcs,
+        fallback_project_id=fallback_project_id,
+    )
+    if not downloaded:
+        raise VpeJobError(f"Could not download audio {uri}.")
+    staged_uri = await asyncio.to_thread(
+        vpe_gcs.upload_file_to_gcs,
+        local_path=str(local_audio),
+        destination_blob_name=f"{prefix}/{slot_name}.{ext}",
+        mime_type=mime_type,
+    )
+    if not staged_uri:
+        raise VpeJobError(f"Could not stage audio {slot_name} to VPE bucket.")
+    return VpeMediaRef(gcs_uri=staged_uri, mime_type=mime_type)
+
+
+async def _resolve_video_input_uri(
+    request_dto: CreateVeoDto,
+    media_repo: MediaRepository,
+    source_asset_repo: SourceAssetRepository,
+) -> tuple[str | None, bool]:
+    """Resolves a driving/edit video URI and whether its parent is a blue mesh."""
+    candidates = []
+    if request_dto.reference_video:
+        candidates.append(request_dto.reference_video)
+    if request_dto.reference_videos:
+        candidates.extend(request_dto.reference_videos)
+    if request_dto.edit_source:
+        candidates.append(request_dto.edit_source)
+    if request_dto.source_video_asset_id:
+        candidates.append(request_dto.source_video_asset_id)
+
+    for ref in candidates:
+        uri = await _resolve_asset_ref_uri(ref, media_repo, source_asset_repo)
+        if uri:
+            is_mesh = bool(request_dto.is_blue_mesh_input)
+            if getattr(ref, "type", None) == "media_item":
+                parent = await media_repo.get_by_id(ref.id)
+                raw = getattr(parent, "raw_data", None)
+                if isinstance(raw, dict) and raw.get("is_blue_mesh"):
+                    is_mesh = True
+            return uri, is_mesh
+
+    if request_dto.source_media_items:
+        for smi in request_dto.source_media_items:
+            if smi.role in {
+                AssetRoleEnum.EDIT_SOURCE,
+                AssetRoleEnum.VIDEO_REFERENCE,
+                AssetRoleEnum.VIDEO_EXTENSION_SOURCE,
+            }:
+                parent = await media_repo.get_by_id(smi.media_item_id)
+                if (
+                    parent
+                    and parent.gcs_uris
+                    and 0 <= smi.media_index < len(parent.gcs_uris)
+                ):
+                    raw = getattr(parent, "raw_data", None)
+                    is_mesh = bool(request_dto.is_blue_mesh_input) or (
+                        isinstance(raw, dict) and bool(raw.get("is_blue_mesh"))
+                    )
+                    return parent.gcs_uris[smi.media_index], is_mesh
+
+    return None, bool(request_dto.is_blue_mesh_input)
 
 
 def _process_vpe_upscale_in_background(  # noqa: PLR0915
     media_item_id: int,
     source_gcs_uri: str,
-    resolution: VpeUpscaleResolution,
-    sharpness: int | None,
+    resolution: VpeUpscaleResolution = VpeUpscaleResolution.UHD_4K,
+    sharpness: int | None = None,
     workspace_id: int | None = None,
+    *,
+    upscale_mode: str | None = None,
+    steps: int | None = None,
+    seed: int | None = None,
+    output_codec: str = "h264",
+    compression_quality: str = "optimized",
+    parent_raw_data: dict[str, Any] | None = None,
 ):
-    """Background worker that upscales one gallery video.
-
-    Args:
-        media_item_id: The placeholder row to fill in.
-        source_gcs_uri: The clip to upscale, in the app's own bucket.
-        resolution: Target resolution.
-        sharpness: Sharpening strength, or None for the model's default.
-        workspace_id: Optional workspace ID for multi-project GCS routing.
-    """
-    worker_logger = _worker_logger(media_item_id)
+    """Background worker that upscales one gallery video via GMP or Veo Upscaler."""
+    worker_logger = _worker_logger(media_item_id, "upscale")
     temp_dir = f"temp/vpe_{media_item_id}"
+    resolved_mode = upscale_mode or (
+        "1080p" if resolution == VpeUpscaleResolution.HD_1080P else "4k"
+    )
 
     try:
         loop = asyncio.new_event_loop()
@@ -500,7 +977,6 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                         work = Path(temp_dir)
                         work.mkdir(parents=True, exist_ok=True)
 
-                        # 1. Bring the source down (handling cross-bucket URIs).
                         source_path = str(work / "source.mp4")
                         downloaded = await _download_asset_gcs(
                             source_gcs_uri,
@@ -514,13 +990,227 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                 f"Could not download {source_gcs_uri}.",
                             )
 
-                        # 2. Measure it. The row's stored metadata was only
-                        # ever enough to rule the job out; the upscaler
-                        # validates a frame rate and an exact frame size that
-                        # the row does not carry, so the file is the only
-                        # thing that can clear a job to run.
                         probe = await asyncio.to_thread(
                             probe_media, source_path
+                        )
+                        prefix = f"vpe/upscale/{media_item_id}"
+
+                        # Branch 1: Seamless Video Texture upscaling (4K only,
+                        # ProRes or DNxHR required by API when seamless=True).
+                        if is_seamless_raw_data(parent_raw_data):
+                            s_raw = (
+                                parent_raw_data.get("seamless")
+                                if isinstance(parent_raw_data, dict)
+                                else {}
+                            )
+                            seamless_flags = (
+                                VpeSeamlessFlags(
+                                    loop=bool(s_raw.get("loop")),
+                                    tessellate_horizontal=bool(
+                                        s_raw.get("tessellate_horizontal")
+                                        or s_raw.get("tessellateHorizontal")
+                                    ),
+                                    tessellate_vertical=bool(
+                                        s_raw.get("tessellate_vertical")
+                                        or s_raw.get("tessellateVertical")
+                                    ),
+                                )
+                                if isinstance(s_raw, dict)
+                                else VpeSeamlessFlags(loop=True)
+                            )
+                            effective_codec = (
+                                output_codec
+                                if output_codec in ("prores", "dnxhr")
+                                else "prores"
+                            )
+                            src_mime = probe.mime_type or _MP4
+                            staged_src_uri = await asyncio.to_thread(
+                                vpe_gcs.upload_file_to_gcs,
+                                local_path=source_path,
+                                destination_blob_name=f"{prefix}/in_seamless.mp4",
+                                mime_type=src_mime,
+                            )
+                            if not staged_src_uri:
+                                raise VpeJobError(
+                                    "Could not stage seamless source video."
+                                )
+                            uploaded_segment_uris.append(staged_src_uri)
+
+                            seamless_dict = {
+                                "loop": seamless_flags.loop,
+                                "tessellate_horizontal": (
+                                    seamless_flags.tessellate_horizontal
+                                ),
+                                "tessellate_vertical": (
+                                    seamless_flags.tessellate_vertical
+                                ),
+                            }
+                            vpe_req = VpeRequest(
+                                capability_id=VpeCapabilityId.UPSCALE_SEAMLESS,
+                                storage_uri=f"gs://{cfg.VPE_BUCKET}/{prefix}/out",
+                                video=VpeMediaRef(
+                                    gcs_uri=staged_src_uri,
+                                    mime_type=src_mime,
+                                ),
+                                resolution="4k",
+                                aspect_ratio="16:9",
+                                codec=effective_codec,
+                                compression_quality=compression_quality,
+                                sharpness=sharpness,
+                                seamless=seamless_flags,
+                            )
+                            result, _ = await _submit_and_wait_with_retry(
+                                client,
+                                vpe_req,
+                                media_repo,
+                                media_item_id,
+                                worker_logger,
+                                base_raw_data={"seamless": seamless_dict},
+                            )
+                            delivered = await _deliver_gmp_output(
+                                result=result,
+                                output_codec=effective_codec,
+                                compression_quality=compression_quality,
+                                dest_prefix=(
+                                    f"upscaled_videos/{media_item_id}_4k"
+                                ),
+                                work=work,
+                                vpe_gcs=vpe_gcs,
+                                app_gcs=app_gcs,
+                                base_raw_data={
+                                    "vpe_capability": (
+                                        VpeCapabilityId.UPSCALE_SEAMLESS.value
+                                    ),
+                                    "seamless": seamless_dict,
+                                },
+                                audio_restore_source=Path(source_path),
+                            )
+                            await media_repo.update(
+                                media_item_id,
+                                {
+                                    "status": JobStatusEnum.COMPLETED,
+                                    "model": GenerationModelEnum.VEO_3_1_UPSCALE,
+                                    "generation_time": (
+                                        time.monotonic() - start_time
+                                    ),
+                                    "num_media": 1,
+                                    **delivered,
+                                },
+                            )
+                            await asyncio.to_thread(
+                                _discard_segments,
+                                vpe_gcs,
+                                uploaded_segment_uris,
+                                worker_logger,
+                            )
+                            return
+
+                        # Branch 2: Unsplit GMP Super Resolution (4K / 4K Pro /
+                        # 8K) for clips <= 240 frames, preserving native FPS,
+                        # Cinema/Consumer aspect ratio, and 48 kHz audio.
+                        if (
+                            resolved_mode in _SUPER_RES_MODE_MAP
+                            and probe.frame_count is not None
+                            and probe.frame_count <= 240
+                        ):
+                            super_res_mode = _SUPER_RES_MODE_MAP[resolved_mode]
+                            check_super_res_upscalable(probe, super_res_mode)
+                            src_mime = probe.mime_type or _MP4
+                            src_ext = {
+                                MIME_QUICKTIME: "mov",
+                                MIME_MXF: "mxf",
+                            }.get(src_mime, "mp4")
+                            staged_src_uri = await asyncio.to_thread(
+                                vpe_gcs.upload_file_to_gcs,
+                                local_path=source_path,
+                                destination_blob_name=(
+                                    f"{prefix}/in_source.{src_ext}"
+                                ),
+                                mime_type=src_mime,
+                            )
+                            if not staged_src_uri:
+                                raise VpeJobError(
+                                    "Could not upload source clip to VPE bucket."
+                                )
+                            uploaded_segment_uris.append(staged_src_uri)
+
+                            vpe_req = VpeRequest(
+                                capability_id=VpeCapabilityId.SUPER_RES,
+                                storage_uri=f"gs://{cfg.VPE_BUCKET}/{prefix}/out",
+                                video=VpeMediaRef(
+                                    gcs_uri=staged_src_uri,
+                                    mime_type=src_mime,
+                                ),
+                                super_res_mode=super_res_mode,
+                                super_res_steps=steps,
+                                sharpness=sharpness,
+                                seed=seed,
+                                codec=output_codec,
+                                compression_quality=compression_quality,
+                            )
+                            result, op_name = await _submit_and_wait_with_retry(
+                                client,
+                                vpe_req,
+                                media_repo,
+                                media_item_id,
+                                worker_logger,
+                                base_raw_data={
+                                    "super_res_mode": super_res_mode,
+                                },
+                            )
+                            delivered = await _deliver_gmp_output(
+                                result=result,
+                                output_codec=output_codec,
+                                compression_quality=compression_quality,
+                                dest_prefix=(
+                                    f"upscaled_videos/{media_item_id}_{resolved_mode}"
+                                ),
+                                work=work,
+                                vpe_gcs=vpe_gcs,
+                                app_gcs=app_gcs,
+                                base_raw_data={
+                                    "vpe_capability": (
+                                        VpeCapabilityId.SUPER_RES.value
+                                    ),
+                                    "vpe_operation_names": [op_name],
+                                    "super_res_mode": super_res_mode,
+                                },
+                                audio_restore_source=Path(source_path),
+                            )
+                            await media_repo.update(
+                                media_item_id,
+                                {
+                                    "status": JobStatusEnum.COMPLETED,
+                                    "model": (
+                                        GenerationModelEnum.VEO_EXP_SUPER_RES
+                                    ),
+                                    "generation_time": (
+                                        time.monotonic() - start_time
+                                    ),
+                                    "num_media": 1,
+                                    **delivered,
+                                },
+                            )
+                            await asyncio.to_thread(
+                                _discard_segments,
+                                vpe_gcs,
+                                uploaded_segment_uris,
+                                worker_logger,
+                            )
+                            return
+
+                        # Branch 3: Segmented veo3p1_upscale pipeline (1080p or
+                        # clips > 240 frames).
+                        if resolved_mode in ("4k_pro", "8k"):
+                            raise VpeJobError(
+                                f"Upscale mode '{resolved_mode}' supports up"
+                                " to 240 frames (10s at 24fps)."
+                            )
+
+                        target_res = (
+                            VpeUpscaleResolution.HD_1080P
+                            if resolved_mode == "1080p"
+                            else VpeUpscaleResolution.UHD_4K
                         )
                         check_upscalable(probe)
                         segments = plan_upscale(probe)
@@ -532,11 +1222,6 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                             aspect_ratio,
                         )
 
-                        # 3. Cut every piece before uploading any of them.
-                        # Cutting is local and free, submitting is neither, so
-                        # a cut that comes up short - a source whose container
-                        # over-declares its length - has to be found while the
-                        # only thing spent is time.
                         pieces = []
                         for segment in segments:
                             pieces.append(
@@ -550,11 +1235,18 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                 ),
                             )
 
-                        # 4. Upload every piece, then submit them all before
-                        # waiting on any. The wait is minutes and the
-                        # submission is a round trip, so this is what lets the
-                        # segments run concurrently.
-                        prefix = f"vpe/upscale/{media_item_id}"
+                        seg_codec = (
+                            output_codec
+                            if target_res == VpeUpscaleResolution.UHD_4K
+                            and output_codec != "h264"
+                            else None
+                        )
+                        seg_quality = (
+                            compression_quality
+                            if compression_quality != "optimized"
+                            else None
+                        )
+
                         requests = []
                         operations = []
                         for segment, piece in zip(segments, pieces):
@@ -573,60 +1265,56 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                     f" gs://{cfg.VPE_BUCKET}.",
                                 )
                             uploaded_segment_uris.append(segment_uri)
-                            request = build_segment_request(
+                            req = build_segment_request(
                                 segment_uri=segment_uri,
                                 storage_uri=(
                                     f"gs://{cfg.VPE_BUCKET}/{prefix}"
                                     f"/out_{segment.index:02d}"
                                 ),
                                 aspect_ratio=aspect_ratio,
-                                resolution=resolution,
+                                resolution=target_res,
                                 sharpness=sharpness,
+                                codec=seg_codec,
+                                compression_quality=seg_quality,
                             )
-                            requests.append(request)
+                            requests.append(req)
                             operations.append(
                                 await asyncio.to_thread(
                                     client.submit,
-                                    build_payload(request),
+                                    build_payload(req),
                                 ),
                             )
 
-                        # 5. Record the operation names before blocking on
-                        # them. This is the whole recoverability story: the
-                        # pool is shut down without waiting, so an
-                        # interrupted worker loses its polling loop and
-                        # nothing else. Without these names on the row there
-                        # is no way to ask the service what became of a job
-                        # that was already paid for.
+                        seg_raw_data: dict[str, Any] = {
+                            "vpe_capability": VpeCapabilityId.UPSCALE.value,
+                            "vpe_operation_names": [
+                                operation.name for operation in operations
+                            ],
+                            "vpe_segments": [
+                                {
+                                    "index": segment.index,
+                                    "first_frame": segment.first_frame,
+                                    "frames": segment.frames,
+                                }
+                                for segment in segments
+                            ],
+                        }
                         await record_worker_progress(
                             media_repo,
                             media_item_id,
                             worker_logger,
-                            {
-                                "raw_data": {
-                                    "vpe_capability": (
-                                        VpeCapabilityId.UPSCALE.value
-                                    ),
-                                    "vpe_operation_names": [
-                                        operation.name
-                                        for operation in operations
-                                    ],
-                                    "vpe_segments": [
-                                        {
-                                            "index": segment.index,
-                                            "first_frame": segment.first_frame,
-                                            "frames": segment.frames,
-                                        }
-                                        for segment in segments
-                                    ],
-                                },
-                            },
+                            {"raw_data": seg_raw_data},
                         )
 
-                        # 6. Wait for each in turn with automatic retries for
-                        # transient capacity or high load errors.
+                        out_ext, out_mime, out_resolved_codec = (
+                            _detect_gmp_delivery_format(
+                                "",
+                                "",
+                                seg_codec,
+                            )
+                        )
                         upscaled: list[Path] = []
-                        for segment, operation, request in zip(
+                        for segment, operation, req in zip(
                             segments, operations, requests
                         ):
                             max_retries = 3
@@ -639,7 +1327,8 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                         timeout_seconds=SEGMENT_TIMEOUT_SECONDS,
                                     )
                                     local = (
-                                        work / f"out_{segment.index:02d}.mp4"
+                                        work
+                                        / f"out_{segment.index:02d}.{out_ext}"
                                     )
                                     fetched = await asyncio.to_thread(
                                         vpe_gcs.download_from_gcs,
@@ -652,37 +1341,28 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                         raise VpeJobError(
                                             "Segment"
                                             f" {segment.index} finished but its"
-                                            " output could not be downloaded from"
+                                            " output could not be downloaded"
+                                            " from"
                                             f" {result.primary_video.gcs_uri}.",
                                         )
                                     upscaled.append(local)
                                     break
-                                except Exception as err:
-                                    is_retryable = (
-                                        getattr(err, "retryable", False)
-                                        or "unavailable" in str(err).lower()
-                                        or "overloaded" in str(err).lower()
-                                        or "resource exhausted"
-                                        in str(err).lower()
-                                        or "high load" in str(err).lower()
-                                    )
+                                except Exception as err:  # noqa: BLE001
                                     if (
-                                        is_retryable
+                                        _is_retryable_vpe_error(err)
                                         and attempt < max_retries - 1
                                     ):
                                         backoff = (attempt + 1) * 15
                                         worker_logger.warning(
-                                            "Segment %d failed with retryable error (%s). Retrying in %ds (attempt %d/%d)...",
+                                            "Segment %d retry in %ds (%s)",
                                             segment.index,
-                                            err,
                                             backoff,
-                                            attempt + 1,
-                                            max_retries,
+                                            err,
                                         )
                                         await asyncio.sleep(backoff)
                                         current_op = await asyncio.to_thread(
                                             client.submit,
-                                            build_payload(request),
+                                            build_payload(req),
                                         )
                                         continue
                                     raise
@@ -692,35 +1372,62 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                 worker_logger,
                             )
 
-                        # 7. Rejoin, then lay the original sound back over
-                        # the result. A single segment skips the join: there
-                        # is no seam to make and a stream copy would only
-                        # cost a rewrite.
                         if len(upscaled) == 1:
                             joined = upscaled[0]
                         else:
                             joined = await asyncio.to_thread(
                                 concat_segments,
                                 list(upscaled),
-                                work / "joined.mp4",
+                                work / f"joined.{out_ext}",
                             )
-                        final_path = await asyncio.to_thread(
-                            restore_audio,
-                            joined,
-                            source_path,
-                            work / "master.mp4",
-                        )
 
-                        # 8. Back into the app's bucket, where the gallery
-                        # can serve it.
-                        destination = (
+                        dest_prefix = (
                             f"upscaled_videos/{media_item_id}_"
-                            f"{resolution.value}.mp4"
+                            f"{target_res.value}"
                         )
+                        if out_resolved_codec in ("prores", "dnxhr"):
+                            master_gcs_uri = await asyncio.to_thread(
+                                app_gcs.upload_file_to_gcs,
+                                local_path=str(joined),
+                                destination_blob_name=(
+                                    f"{dest_prefix}_master.{out_ext}"
+                                ),
+                                mime_type=out_mime,
+                            )
+                            if not master_gcs_uri:
+                                raise VpeJobError(
+                                    "Could not upload joined professional"
+                                    " master."
+                                )
+                            seg_raw_data["master_gcs_uris"] = [master_gcs_uri]
+                            seg_raw_data["output_codec"] = out_resolved_codec
+                            seg_raw_data["compression_quality"] = (
+                                compression_quality
+                            )
+                            preview_h264 = work / "preview_h264.mp4"
+                            await asyncio.to_thread(
+                                transcode_to_h264_preview,
+                                joined,
+                                preview_h264,
+                            )
+                            final_path = await asyncio.to_thread(
+                                restore_audio,
+                                preview_h264,
+                                source_path,
+                                work / "master.mp4",
+                            )
+                        else:
+                            final_path = await asyncio.to_thread(
+                                restore_audio,
+                                joined,
+                                source_path,
+                                work / "master.mp4",
+                            )
+
                         final_gcs_uri = await asyncio.to_thread(
                             app_gcs.upload_file_to_gcs,
                             local_path=str(final_path),
-                            destination_blob_name=destination,
+                            destination_blob_name=f"{dest_prefix}.mp4",
                             mime_type=_MP4,
                         )
                         if not final_gcs_uri:
@@ -738,15 +1445,11 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                 app_gcs.upload_file_to_gcs,
                                 local_path=thumbnail_path,
                                 destination_blob_name=(
-                                    f"upscaled_videos/{media_item_id}"
-                                    "_thumb.png"
+                                    f"upscaled_videos/{media_item_id}_thumb.png"
                                 ),
                                 mime_type="image/png",
                             )
 
-                        # 9. Measure the delivered master rather than
-                        # assuming it. The request asked for 4K; what the row
-                        # should say is what came back.
                         measured_metadata = await asyncio.to_thread(
                             build_measured_metadata,
                             str(final_path),
@@ -756,12 +1459,14 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                             media_item_id,
                             {
                                 "status": JobStatusEnum.COMPLETED,
+                                "model": GenerationModelEnum.VEO_3_1_UPSCALE,
                                 "gcs_uris": [final_gcs_uri],
                                 "thumbnail_uris": (
                                     [thumbnail_gcs_uri]
                                     if thumbnail_gcs_uri
                                     else []
                                 ),
+                                "raw_data": seg_raw_data,
                                 "generation_time": (
                                     time.monotonic() - start_time
                                 ),
@@ -769,9 +1474,6 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                                 **measured_metadata,
                             },
                         )
-                        # Only on success. A failed job's inputs are the
-                        # reproduction case, and they are the first thing
-                        # anyone debugging it will ask for.
                         await asyncio.to_thread(
                             _discard_segments,
                             vpe_gcs,
@@ -781,7 +1483,7 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                         worker_logger.info(
                             "Upscaled media item %s to %s",
                             media_item_id,
-                            resolution.value,
+                            target_res.value,
                         )
 
                     except Exception as error:  # noqa: BLE001
@@ -791,9 +1493,6 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
                             exc_info=True,
                         )
                         try:
-                            # Without the rollback a database failure takes
-                            # the status write down with it and the job never
-                            # leaves `processing`.
                             await db.rollback()
                             await media_repo.update(
                                 media_item_id,
@@ -825,60 +1524,27 @@ def _process_vpe_upscale_in_background(  # noqa: PLR0915
         )
 
 
-def _discard_segments(
-    vpe_gcs: GcsService,
-    uris: list[str],
-    worker_logger: logging.Logger,
-) -> None:
-    """Deletes the intermediate segments uploaded for one job.
-
-    Best effort. The master is already saved by the time this runs, so a
-    failure here is litter in a bucket and not a lost job.
-
-    Args:
-        vpe_gcs: Storage service pointed at VPE's bucket.
-        uris: The uploaded segment URIs to remove.
-        worker_logger: The job's logger.
-    """
-    for uri in uris:
-        try:
-            vpe_gcs.delete_blob_from_uri(uri)
-        except Exception as error:  # noqa: BLE001
-            worker_logger.warning("Could not delete %s: %s", uri, error)
-
-
-def _process_vpe_dialogue_in_background(  # noqa: PLR0915
+def _run_gmp_generation_worker(
     media_item_id: int,
-    request_dto: CreateVeoDto,
-    user_email: str,
+    worker_tag: str,
+    coro_fn: Callable[
+        [
+            MediaRepository,
+            SourceAssetRepository,
+            GcsService,
+            GcsService,
+            VpeClient,
+            Path,
+            str | None,
+            logging.Logger,
+        ],
+        Any,
+    ],
+    workspace_id: int | None,
 ) -> None:
-    """Background worker that generates a dialogue-driven lip-sync video.
-
-    Args:
-        media_item_id: The MediaItem row to update with progress and results.
-        request_dto: Request parameters including image, audio, prompt, and ratio.
-        user_email: Requesting user email.
-    """
-    worker_logger = logging.getLogger(f"vpe_dialogue_worker.{media_item_id}")
-    worker_logger.setLevel(logging.INFO)
-    if worker_logger.hasHandlers():
-        worker_logger.handlers.clear()
-
-    if os.getenv("ENVIRONMENT") == "production":
-        handler = CloudLoggingHandler(
-            LoggerClient(),
-            name=f"vpe_dialogue_worker.{media_item_id}",
-        )
-    else:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s - [VPE_DIALOGUE_WORKER] - %(levelname)s - %(message)s",
-            ),
-        )
-    worker_logger.addHandler(handler)
-
-    temp_dir = tempfile.mkdtemp(prefix=f"vpe_dialogue_{media_item_id}_")
+    """Shared lifecycle runner for GMP background generation workers."""
+    worker_logger = _worker_logger(media_item_id, worker_tag)
+    temp_dir = tempfile.mkdtemp(prefix=f"vpe_{worker_tag}_{media_item_id}_")
 
     try:
         loop = asyncio.new_event_loop()
@@ -901,7 +1567,7 @@ def _process_vpe_dialogue_in_background(  # noqa: PLR0915
 
                         target_project_id, target_bucket_name = (
                             await _resolve_workspace_gcs_config(
-                                db, request_dto.workspace_id, worker_logger
+                                db, workspace_id, worker_logger
                             )
                         )
                         app_gcs = GcsService(
@@ -913,910 +1579,40 @@ def _process_vpe_dialogue_in_background(  # noqa: PLR0915
                             project_id=cfg.VPE_PROJECT_ID,
                         )
                         client = VpeClient(project_id=cfg.VPE_PROJECT_ID)
-
                         start_time = time.monotonic()
                         work = Path(temp_dir)
                         work.mkdir(parents=True, exist_ok=True)
 
-                        # 1. Resolve & Download input image
-                        image_gcs_uri = None
-                        if request_dto.start_image_asset_id:
-                            ref = request_dto.start_image_asset_id
-                            if ref.type == "media_item":
-                                parent_item = await media_repo.get_by_id(ref.id)
-                                if parent_item and parent_item.gcs_uris:
-                                    image_gcs_uri = parent_item.gcs_uris[
-                                        ref.index or 0
-                                    ]
-                            else:
-                                asset = await source_asset_repo.get_by_id(
-                                    ref.id
-                                )
-                                if asset:
-                                    image_gcs_uri = asset.gcs_uri
-                        elif request_dto.reference_images:
-                            ref_img = request_dto.reference_images[0]
-                            asset = await source_asset_repo.get_by_id(
-                                ref_img.asset_id
-                            )
-                            if asset:
-                                image_gcs_uri = asset.gcs_uri
-                        elif request_dto.source_media_items:
-                            for smi in request_dto.source_media_items:
-                                if smi.role in {
-                                    AssetRoleEnum.START_FRAME,
-                                    AssetRoleEnum.IMAGE_REFERENCE_ASSET,
-                                }:
-                                    parent_item = await media_repo.get_by_id(
-                                        smi.media_item_id
-                                    )
-                                    if parent_item and parent_item.gcs_uris:
-                                        image_gcs_uri = parent_item.gcs_uris[
-                                            smi.media_index
-                                        ]
-                                        break
-
-                        if not image_gcs_uri:
-                            raise VpeJobError(
-                                "No input image could be resolved for dialogue generation.",
-                            )
-
-                        local_raw_image = work / "input_image_raw.png"
-                        downloaded = await _download_asset_gcs(
-                            image_gcs_uri,
-                            local_raw_image,
-                            app_gcs,
-                            vpe_gcs,
-                            fallback_project_id=target_project_id,
-                        )
-                        if not downloaded:
-                            raise VpeJobError(
-                                f"Could not download input image {image_gcs_uri}.",
-                            )
-
-                        # 2. Resolve & Download input audio
-                        if not request_dto.reference_audio:
-                            raise VpeJobError(
-                                "No reference audio was provided for dialogue generation.",
-                            )
-
-                        audio_ref = request_dto.reference_audio
-                        audio_gcs_uri = None
-                        if audio_ref.type == "media_item":
-                            parent_item = await media_repo.get_by_id(
-                                audio_ref.id
-                            )
-                            if parent_item and parent_item.gcs_uris:
-                                audio_gcs_uri = parent_item.gcs_uris[
-                                    audio_ref.index or 0
-                                ]
-                        else:
-                            asset = await source_asset_repo.get_by_id(
-                                audio_ref.id
-                            )
-                            if asset:
-                                audio_gcs_uri = asset.gcs_uri
-
-                        if not audio_gcs_uri:
-                            raise VpeJobError(
-                                "No audio track could be resolved for dialogue generation.",
-                            )
-
-                        local_raw_audio = work / "input_audio_raw"
-                        downloaded = await _download_asset_gcs(
-                            audio_gcs_uri,
-                            local_raw_audio,
-                            app_gcs,
-                            vpe_gcs,
-                            fallback_project_id=target_project_id,
-                        )
-                        if not downloaded:
-                            raise VpeJobError(
-                                f"Could not download reference audio {audio_gcs_uri}.",
-                            )
-
-                        # 3. Transcode/Prepare audio & image
-                        is_portrait = (
-                            request_dto.aspect_ratio
-                            == AspectRatioEnum.RATIO_9_16
-                        )
-                        local_norm_audio = work / "audio_8s.wav"
-                        local_norm_frame = work / "frame_1280x720.png"
-
-                        await asyncio.to_thread(
-                            prepare_dialogue_audio,
-                            local_raw_audio,
-                            local_norm_audio,
-                        )
-                        await asyncio.to_thread(
-                            prepare_dialogue_frame,
-                            local_raw_image,
-                            local_norm_frame,
-                            is_portrait=is_portrait,
-                        )
-
-                        # 4. Upload staged inputs to VPE staging
-                        prefix = f"vpe/dialogue/{media_item_id}"
-                        staged_frame_uri = await asyncio.to_thread(
-                            vpe_gcs.upload_file_to_gcs,
-                            local_path=str(local_norm_frame),
-                            destination_blob_name=f"{prefix}/frame.png",
-                            mime_type="image/png",
-                        )
-                        staged_audio_uri = await asyncio.to_thread(
-                            vpe_gcs.upload_file_to_gcs,
-                            local_path=str(local_norm_audio),
-                            destination_blob_name=f"{prefix}/audio_8s.wav",
-                            mime_type="audio/wav",
-                        )
-
-                        # 5. Build and submit VpeRequest
-                        storage_uri = f"gs://{cfg.VPE_BUCKET}/{prefix}/out"
-                        vpe_req = VpeRequest(
-                            capability_id=VpeCapabilityId.DIALOGUE_DRIVEN,
-                            storage_uri=storage_uri,
-                            prompt=request_dto.prompt,
-                            image=VpeMediaRef(
-                                gcs_uri=staged_frame_uri, mime_type="image/png"
-                            ),
-                            reference_audios=(
-                                VpeMediaRef(
-                                    gcs_uri=staged_audio_uri,
-                                    mime_type="audio/wav",
-                                ),
-                            ),
-                        )
-                        operation = await asyncio.to_thread(
-                            client.submit,
-                            build_payload(vpe_req),
-                        )
-                        worker_logger.info(
-                            "VPE dialogue operation submitted: %s",
-                            operation.name,
-                        )
-
-                        await media_repo.update(
-                            media_item_id,
-                            {"raw_data": {"operation": operation.name}},
-                        )
-
-                        # 6. Poll operation with retry on transient errors
-                        result = None
-                        max_poll_seconds = 1800
-                        poll_interval = 10
-                        poll_start = time.monotonic()
-
-                        while time.monotonic() - poll_start < max_poll_seconds:
-                            try:
-                                poll_res = await asyncio.to_thread(
-                                    client.poll, operation.name
-                                )
-                                if poll_res.has_error:
-                                    raise VpeJobError(
-                                        "Dialogue generation failed on Vertex AI: "
-                                        f"{poll_res.raw.get('error')}",
-                                    )
-                                if poll_res.done:
-                                    result = parse_result(poll_res)
-                                    break
-                            except Exception as poll_err:  # noqa: BLE001
-                                is_transient = (
-                                    "capacity" in str(poll_err).lower()
-                                    or "unavailable" in str(poll_err).lower()
-                                    or "429" in str(poll_err)
-                                    or "503" in str(poll_err)
-                                )
-                                if not is_transient:
-                                    raise
-                                worker_logger.warning(
-                                    "Transient poll error (%s), retrying in %ds...",
-                                    poll_err,
-                                    poll_interval,
-                                )
-                            await asyncio.sleep(poll_interval)
-
-                        if not result or not result.primary_video:
-                            raise VpeJobError(
-                                "Dialogue generation timed out or returned no primary video.",
-                            )
-
-                        # 7. Download generated video from VPE bucket
-                        local_gen_video = work / "generated_raw.mp4"
-                        fetched = await asyncio.to_thread(
-                            vpe_gcs.download_from_gcs,
-                            gcs_uri_path=_blob_path(
-                                result.primary_video.gcs_uri
-                            ),
-                            destination_file_path=str(local_gen_video),
-                        )
-                        if not fetched:
-                            raise VpeJobError(
-                                "Could not download generated video from "
-                                f"{result.primary_video.gcs_uri}",
-                            )
-
-                        # 8. Post-process (crop back to 9:16 if portrait)
-                        local_final_video = work / "final.mp4"
-                        await asyncio.to_thread(
-                            postprocess_dialogue_video,
-                            local_gen_video,
-                            local_final_video,
-                            is_portrait=is_portrait,
-                        )
-
-                        # 9. Upload final video + thumbnail to app bucket
-                        dest_video = (
-                            f"generated_videos/dialogue_{media_item_id}.mp4"
-                        )
-                        final_gcs_uri = await asyncio.to_thread(
-                            app_gcs.upload_file_to_gcs,
-                            local_path=str(local_final_video),
-                            destination_blob_name=dest_video,
-                            mime_type=_MP4,
-                        )
-
-                        thumb_path = await asyncio.to_thread(
-                            generate_thumbnail,
-                            str(local_final_video),
-                        )
-                        thumb_gcs_uri = None
-                        if thumb_path:
-                            thumb_gcs_uri = await asyncio.to_thread(
-                                app_gcs.upload_file_to_gcs,
-                                local_path=thumb_path,
-                                destination_blob_name=(
-                                    f"generated_videos/dialogue_{media_item_id}_thumb.png"
-                                ),
-                                mime_type="image/png",
-                            )
-
-                        measured_metadata = await asyncio.to_thread(
-                            build_measured_metadata,
-                            str(local_final_video),
-                        )
-
-                        # 10. Update row to COMPLETED
-                        await media_repo.update(
-                            media_item_id,
-                            {
-                                "status": JobStatusEnum.COMPLETED,
-                                "gcs_uris": [final_gcs_uri],
-                                "thumbnail_uris": (
-                                    [thumb_gcs_uri] if thumb_gcs_uri else []
-                                ),
-                                "generation_time": (
-                                    time.monotonic() - start_time
-                                ),
-                                "num_media": 1,
-                                **measured_metadata,
-                            },
-                        )
-                        worker_logger.info(
-                            "Dialogue generation completed for media item %s",
-                            media_item_id,
-                        )
-
-                    except Exception as error:  # noqa: BLE001
-                        worker_logger.error(
-                            "VPE dialogue failed: %s", error, exc_info=True
-                        )
-                        try:
-                            await db.rollback()
-                            await media_repo.update(
-                                media_item_id,
-                                {
-                                    "status": JobStatusEnum.FAILED,
-                                    "error_message": str(error),
-                                },
-                            )
-                        except Exception as update_error:  # noqa: BLE001
-                            worker_logger.error(
-                                "Could not record the failure on media item %s: %s",
-                                media_item_id,
-                                update_error,
-                                exc_info=True,
-                            )
-                    finally:
-                        if os.path.exists(temp_dir):
-                            shutil.rmtree(temp_dir)
-
-        loop.run_until_complete(_async_worker())
-        loop.close()
-
-    except Exception as error:  # noqa: BLE001
-        worker_logger.error(
-            "VPE dialogue worker failed to initialize: %s",
-            error,
-            exc_info=True,
-        )
-
-
-def _process_vpe_transform_in_background(
-    media_item_id: int,
-    request_dto: CreateVeoDto,
-    user_email: str,
-) -> None:
-    """Background worker for veo-exp-video-transform requests."""
-    worker_logger = logging.getLogger(f"vpe_transform_worker_{media_item_id}")
-    worker_logger.setLevel(logging.INFO)
-    if not worker_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s - [VPE_TRANSFORM_WORKER] - %(levelname)s - %(message)s",
-            ),
-        )
-        worker_logger.addHandler(handler)
-
-    temp_dir = tempfile.mkdtemp(prefix=f"vpe_transform_{media_item_id}_")
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def _async_worker():
-            async with WorkerDatabase() as db_factory:
-                async with db_factory() as db:
-                    media_repo = MediaRepository(db)
-                    source_asset_repo = SourceAssetRepository(db)
-                    cfg = config_service
-
-                    try:
-                        await record_worker_progress(
+                        delivered = await coro_fn(
                             media_repo,
-                            media_item_id,
+                            source_asset_repo,
+                            app_gcs,
+                            vpe_gcs,
+                            client,
+                            work,
+                            target_project_id,
                             worker_logger,
                         )
-                        require_vpe_configured(cfg)
-
-                        target_project_id, target_bucket_name = (
-                            await _resolve_workspace_gcs_config(
-                                db, request_dto.workspace_id, worker_logger
-                            )
-                        )
-                        app_gcs = GcsService(
-                            bucket_name=target_bucket_name,
-                            project_id=target_project_id,
-                        )
-                        vpe_gcs = GcsService(
-                            bucket_name=cfg.VPE_BUCKET,
-                            project_id=cfg.VPE_PROJECT_ID,
-                        )
-                        client = VpeClient(project_id=cfg.VPE_PROJECT_ID)
-
-                        start_time = time.monotonic()
-
-                        work = Path(temp_dir)
-                        work.mkdir(parents=True, exist_ok=True)
-
-                        is_keyframe_i2v = bool(
-                            request_dto.start_image_asset_id
-                            and not request_dto.source_video_asset_id
-                            and not request_dto.edit_source
-                            and not (
-                                request_dto.source_media_items
-                                and any(
-                                    item.role
-                                    == AssetRoleEnum.VIDEO_EXTENSION_SOURCE
-                                    for item in request_dto.source_media_items
-                                )
-                            )
-                        )
-
-                        staged_mask_uri = None
-                        local_norm_mask = work / "mask_norm.mp4"
-                        local_norm_video = work / "norm_video_1280x720.mp4"
-                        is_portrait = (
-                            request_dto.aspect_ratio
-                            == AspectRatioEnum.RATIO_9_16
-                        )
-
-                        if is_keyframe_i2v:
-                            # 1. Resolve & Stage first frame image
-                            first_uri = await _resolve_asset_ref_uri(
-                                request_dto.start_image_asset_id,
-                                media_repo,
-                                source_asset_repo,
-                            )
-                            if not first_uri:
-                                raise VpeJobError(
-                                    "No first frame image could be resolved"
-                                    " for keyframe video transform.",
-                                )
-                            local_first_img = work / "first_frame.png"
-                            downloaded = await _download_asset_gcs(
-                                first_uri,
-                                local_first_img,
-                                app_gcs,
-                                vpe_gcs,
-                                fallback_project_id=target_project_id,
-                            )
-                            if not downloaded:
-                                raise VpeJobError(
-                                    f"Could not download first frame image {first_uri}.",
-                                )
-                            staged_first_blob = (
-                                f"vpe/transform/{media_item_id}/first_frame.png"
-                            )
-                            staged_first_uri = await asyncio.to_thread(
-                                vpe_gcs.upload_file_to_gcs,
-                                local_path=str(local_first_img),
-                                destination_blob_name=staged_first_blob,
-                                mime_type="image/png",
-                            )
-                            image_ref = VpeMediaRef(
-                                gcs_uri=staged_first_uri, mime_type="image/png"
-                            )
-
-                            # 2. Resolve optional last frame image
-                            last_frame_ref = None
-                            if request_dto.end_image_asset_id:
-                                last_uri = await _resolve_asset_ref_uri(
-                                    request_dto.end_image_asset_id,
-                                    media_repo,
-                                    source_asset_repo,
-                                )
-                                if last_uri:
-                                    local_last_img = work / "last_frame.png"
-                                    last_downloaded = await _download_asset_gcs(
-                                        last_uri,
-                                        local_last_img,
-                                        app_gcs,
-                                        vpe_gcs,
-                                        fallback_project_id=target_project_id,
-                                    )
-                                    if not last_downloaded:
-                                        raise VpeJobError(
-                                            f"Could not download last frame image {last_uri}.",
-                                        )
-                                    staged_last_blob = f"vpe/transform/{media_item_id}/last_frame.png"
-                                    staged_last_uri = await asyncio.to_thread(
-                                        vpe_gcs.upload_file_to_gcs,
-                                        local_path=str(local_last_img),
-                                        destination_blob_name=staged_last_blob,
-                                        mime_type="image/png",
-                                    )
-                                    last_frame_ref = VpeMediaRef(
-                                        gcs_uri=staged_last_uri,
-                                        mime_type="image/png",
-                                    )
-
-                            # 3. Resolve optional conditioning keyframes
-                            conditioning_frames_list: list[
-                                VpeConditioningFrame
-                            ] = []
-                            if request_dto.conditioning_frames:
-                                for (
-                                    idx,
-                                    cf,
-                                ) in enumerate(request_dto.conditioning_frames):
-                                    cf_uri = await _resolve_asset_ref_uri(
-                                        cf.image_asset_id,
-                                        media_repo,
-                                        source_asset_repo,
-                                    )
-                                    if cf_uri:
-                                        local_cf_img = (
-                                            work
-                                            / f"cf_{cf.frame_number}_{idx}.png"
-                                        )
-                                        cf_downloaded = await _download_asset_gcs(
-                                            cf_uri,
-                                            local_cf_img,
-                                            app_gcs,
-                                            vpe_gcs,
-                                            fallback_project_id=target_project_id,
-                                        )
-                                        if not cf_downloaded:
-                                            raise VpeJobError(
-                                                f"Could not download conditioning frame {cf_uri}.",
-                                            )
-                                        staged_cf_blob = (
-                                            f"vpe/transform/{media_item_id}"
-                                            f"/cf_{cf.frame_number}_{idx}.png"
-                                        )
-                                        staged_cf_uri = await asyncio.to_thread(
-                                            vpe_gcs.upload_file_to_gcs,
-                                            local_path=str(local_cf_img),
-                                            destination_blob_name=staged_cf_blob,
-                                            mime_type="image/png",
-                                        )
-                                        conditioning_frames_list.append(
-                                            VpeConditioningFrame(
-                                                frame_num=cf.frame_number,
-                                                image=VpeMediaRef(
-                                                    gcs_uri=staged_cf_uri,
-                                                    mime_type="image/png",
-                                                ),
-                                            )
-                                        )
-
-                            vpe_req = VpeRequest(
-                                capability_id=VpeCapabilityId.VIDEO_TRANSFORM,
-                                storage_uri=(
-                                    f"gs://{cfg.VPE_BUCKET}/vpe/transform/{media_item_id}/out"
-                                ),
-                                prompt=request_dto.prompt,
-                                image=image_ref,
-                                last_frame=last_frame_ref,
-                                conditioning_frames=(
-                                    tuple(conditioning_frames_list)
-                                    if conditioning_frames_list
-                                    else None
-                                ),
-                                video_transform_strength=None,
-                                num_diffusion_steps=(
-                                    request_dto.num_diffusion_steps or 20
-                                ),
-                                seed=request_dto.seed,
-                            )
-                        else:
-                            # 1. Resolve & Download input video
-                            video_gcs_uri = None
-                            if request_dto.source_video_asset_id:
-                                video_gcs_uri = await _resolve_asset_ref_uri(
-                                    request_dto.source_video_asset_id,
-                                    media_repo,
-                                    source_asset_repo,
-                                )
-                            elif request_dto.edit_source:
-                                video_gcs_uri = await _resolve_asset_ref_uri(
-                                    request_dto.edit_source,
-                                    media_repo,
-                                    source_asset_repo,
-                                )
-                            elif request_dto.source_media_items:
-                                for item in request_dto.source_media_items:
-                                    parent_item = await media_repo.get_by_id(
-                                        item.media_item_id
-                                    )
-                                    if parent_item and parent_item.gcs_uris:
-                                        video_gcs_uri = parent_item.gcs_uris[
-                                            item.media_index or 0
-                                        ]
-                                        break
-
-                            if not video_gcs_uri:
-                                raise VpeJobError(
-                                    "No input video could be resolved for"
-                                    " video transform.",
-                                )
-
-                            local_raw_video = work / "input_video_raw.mp4"
-                            raw_downloaded = await _download_asset_gcs(
-                                video_gcs_uri,
-                                local_raw_video,
-                                app_gcs,
-                                vpe_gcs,
-                                fallback_project_id=target_project_id,
-                            )
-                            if not raw_downloaded:
-                                raise VpeJobError(
-                                    f"Could not download input video {video_gcs_uri}.",
-                                )
-
-                            # Auto-detect portrait orientation from input video
-                            # dimensions so 9:16 clips are padded/cropped
-                            # properly even when request_dto.aspect_ratio is
-                            # left at its 16:9 default.
-                            try:
-                                raw_probe = await asyncio.to_thread(
-                                    probe_media, local_raw_video
-                                )
-                                if (
-                                    raw_probe
-                                    and raw_probe.width
-                                    and raw_probe.height
-                                ):
-                                    is_portrait = bool(raw_probe.is_portrait)
-                            except Exception as probe_err:  # noqa: BLE001
-                                worker_logger.warning(
-                                    "Could not probe input video %s for"
-                                    " orientation (%s); falling back to"
-                                    " requested aspect_ratio=%s.",
-                                    local_raw_video,
-                                    probe_err,
-                                    request_dto.aspect_ratio,
-                                )
-
-                            # 2. Resolve optional mask video
-                            if request_dto.video_transform_mask_asset_id:
-                                mask_gcs_uri = await _resolve_asset_ref_uri(
-                                    request_dto.video_transform_mask_asset_id,
-                                    media_repo,
-                                    source_asset_repo,
-                                )
-
-                                if mask_gcs_uri:
-                                    local_raw_mask = work / "mask_raw.mp4"
-                                    mask_downloaded = await _download_asset_gcs(
-                                        mask_gcs_uri,
-                                        local_raw_mask,
-                                        app_gcs,
-                                        vpe_gcs,
-                                        fallback_project_id=target_project_id,
-                                    )
-                                    if not mask_downloaded:
-                                        raise VpeJobError(
-                                            f"Could not download mask video {mask_gcs_uri}.",
-                                        )
-                                    await asyncio.to_thread(
-                                        prepare_transform_video,
-                                        local_raw_mask,
-                                        local_norm_mask,
-                                        is_portrait,
-                                    )
-                                    staged_mask_blob = f"vpe/transform/{media_item_id}/mask.mp4"
-                                    staged_mask_uri = await asyncio.to_thread(
-                                        vpe_gcs.upload_file_to_gcs,
-                                        local_path=str(local_norm_mask),
-                                        destination_blob_name=staged_mask_blob,
-                                        mime_type="video/mp4",
-                                    )
-
-                            # 3. Transcode/Prepare video (normalize to 24fps 720p, pad if 9:16)
-                            await asyncio.to_thread(
-                                prepare_transform_video,
-                                local_raw_video,
-                                local_norm_video,
-                                is_portrait,
-                            )
-
-                            # 4. Upload normalized video to VPE staging
-                            staged_video_blob = (
-                                f"vpe/transform/{media_item_id}/input.mp4"
-                            )
-                            staged_video_uri = await asyncio.to_thread(
-                                vpe_gcs.upload_file_to_gcs,
-                                local_path=str(local_norm_video),
-                                destination_blob_name=staged_video_blob,
-                                mime_type="video/mp4",
-                            )
-
-                            # 5. Build VPE request
-                            vpe_req = VpeRequest(
-                                capability_id=VpeCapabilityId.VIDEO_TRANSFORM,
-                                storage_uri=(
-                                    f"gs://{cfg.VPE_BUCKET}/vpe/transform/{media_item_id}/out"
-                                ),
-                                prompt=request_dto.prompt,
-                                video=VpeMediaRef(
-                                    gcs_uri=staged_video_uri,
-                                    mime_type="video/mp4",
-                                ),
-                                video_transform_strength=(
-                                    request_dto.video_transform_strength
-                                    if request_dto.video_transform_strength
-                                    is not None
-                                    else 0.5
-                                ),
-                                num_diffusion_steps=(
-                                    request_dto.num_diffusion_steps or 20
-                                ),
-                                video_transform_mask_gcs_uri=staged_mask_uri,
-                                seed=request_dto.seed,
-                            )
-
-                        payload = build_payload(vpe_req)
-                        worker_logger.info(
-                            "Submitting VPE video transform job for media item"
-                            " %s: strength=%s, steps=%s, seed=%s",
-                            media_item_id,
-                            vpe_req.video_transform_strength,
-                            vpe_req.num_diffusion_steps,
-                            vpe_req.seed,
-                        )
-                        operation = await asyncio.to_thread(
-                            client.submit, payload
-                        )
-                        worker_logger.info(
-                            "VPE video transform operation started: %s",
-                            operation.name,
-                        )
-
-                        # 6. Record operation on media item
-                        await media_repo.update(
-                            media_item_id,
-                            {"raw_data": {"vpe_operation": operation.name}},
-                        )
-
-                        # 7. Poll operation to completion
-                        poll_res = operation
-                        poll_interval = 10.0
-                        total_wait = 0.0
-                        max_wait = 900.0  # 15 minutes max
-                        transient_failures = 0
-                        max_transient = 6
-
-                        while not poll_res.done and total_wait < max_wait:
-                            await asyncio.sleep(poll_interval)
-                            total_wait += poll_interval
-                            try:
-                                poll_res = await asyncio.to_thread(
-                                    client.poll, operation.name
-                                )
-                                transient_failures = 0
-                            except Exception as poll_err:  # noqa: BLE001
-                                is_transient = bool(
-                                    getattr(poll_err, "retryable", False)
-                                ) or any(
-                                    tok in str(poll_err).lower()
-                                    for tok in (
-                                        "capacity",
-                                        "unavailable",
-                                        "429",
-                                        "503",
-                                    )
-                                )
-                                if is_transient:
-                                    transient_failures += 1
-                                    worker_logger.warning(
-                                        "Transient error polling VPE operation"
-                                        " %s (attempt %s/%s): %s",
-                                        operation.name,
-                                        transient_failures,
-                                        max_transient,
-                                        poll_err,
-                                    )
-                                    if transient_failures > max_transient:
-                                        raise
-                                    continue
-                                raise
-
-                            await record_worker_progress(
-                                media_repo,
-                                media_item_id,
-                                worker_logger,
-                            )
-                            worker_logger.info(
-                                "Polling VPE video transform operation %s"
-                                " (waited %.1fs, done=%s)",
-                                operation.name,
-                                total_wait,
-                                poll_res.done,
-                            )
-
-                        if not poll_res.done:
-                            raise VpeJobError(
-                                f"VPE video transform job timed out after {total_wait:.1f}s",
-                            )
-
-                        if poll_res.has_error:
-                            error_info = poll_res.raw.get("error") or {}
-                            raise VpeJobError(
-                                f"VPE video transform failed: {error_info.get('message', 'Unknown error')}",
-                            )
-
-                        # 8. Download generated video from VPE output
-                        result = parse_result(poll_res)
-                        if not result.primary_video:
-                            raise VpeJobError(
-                                "VPE video transform finished without"
-                                " producing an output video.",
-                            )
-
-                        local_gen_video = work / "generated_raw.mp4"
-                        gen_downloaded = await asyncio.to_thread(
-                            vpe_gcs.download_from_gcs,
-                            gcs_uri_path=_blob_path(
-                                result.primary_video.gcs_uri
-                            ),
-                            destination_file_path=str(local_gen_video),
-                        )
-                        if not gen_downloaded:
-                            raise VpeJobError(
-                                f"Could not download generated video from {result.primary_video.gcs_uri}",
-                            )
-
-                        # 9. Postprocess (composite over source with mask if masked transform, crop if 9:16 portrait)
-                        video_to_postprocess = local_gen_video
-                        if (
-                            staged_mask_uri
-                            and local_norm_mask.exists()
-                            and local_norm_video.exists()
-                        ):
-                            local_composited = work / "composited_masked.mp4"
-                            composite_cmd = [
-                                "ffmpeg",
-                                "-y",
-                                "-i",
-                                str(local_norm_video),
-                                "-i",
-                                str(local_gen_video),
-                                "-i",
-                                str(local_norm_mask),
-                                "-filter_complex",
-                                "[0:v][1:v][2:v]maskedmerge[outv]",
-                                "-map",
-                                "[outv]",
-                                "-map",
-                                "0:a?",
-                                "-c:v",
-                                "libx264",
-                                "-pix_fmt",
-                                "yuv420p",
-                                "-c:a",
-                                "copy",
-                                str(local_composited),
-                            ]
-                            try:
-                                await asyncio.to_thread(
-                                    subprocess.run,
-                                    composite_cmd,
-                                    check=True,
-                                    capture_output=True,
-                                )
-                                video_to_postprocess = local_composited
-                            except Exception as comp_err:  # noqa: BLE001
-                                worker_logger.warning(
-                                    "Masked compositing fallback: %s",
-                                    comp_err,
-                                )
-
-                        local_final_video = work / "final_transformed.mp4"
-                        await asyncio.to_thread(
-                            postprocess_transform_video,
-                            video_to_postprocess,
-                            local_final_video,
-                            is_portrait,
-                        )
-
-                        # 10. Generate thumbnail
-                        thumb_path = await asyncio.to_thread(
-                            generate_thumbnail,
-                            str(local_final_video),
-                        )
-                        thumb_gcs_uri = None
-                        if thumb_path:
-                            thumb_gcs_uri = await asyncio.to_thread(
-                                app_gcs.upload_file_to_gcs,
-                                local_path=thumb_path,
-                                destination_blob_name=(
-                                    f"generated_videos/transform_{media_item_id}_thumb.png"
-                                ),
-                                mime_type="image/png",
-                            )
-
-                        # 11. Upload final assets to application bucket
-                        final_blob = (
-                            f"generated_videos/transform_{media_item_id}.mp4"
-                        )
-                        final_gcs_uri = await asyncio.to_thread(
-                            app_gcs.upload_file_to_gcs,
-                            local_path=str(local_final_video),
-                            destination_blob_name=final_blob,
-                            mime_type="video/mp4",
-                        )
-
-                        measured_metadata = await asyncio.to_thread(
-                            build_measured_metadata,
-                            str(local_final_video),
-                        )
-
-                        # 12. Update row to COMPLETED
                         await media_repo.update(
                             media_item_id,
                             {
                                 "status": JobStatusEnum.COMPLETED,
-                                "gcs_uris": [final_gcs_uri],
-                                "thumbnail_uris": (
-                                    [thumb_gcs_uri] if thumb_gcs_uri else []
-                                ),
                                 "generation_time": (
                                     time.monotonic() - start_time
                                 ),
                                 "num_media": 1,
-                                **measured_metadata,
+                                **delivered,
                             },
                         )
                         worker_logger.info(
-                            "Video transform completed for media item %s",
+                            "VPE %s completed for media item %s",
+                            worker_tag,
                             media_item_id,
                         )
-
                     except Exception as error:  # noqa: BLE001
                         worker_logger.error(
-                            "VPE video transform failed: %s",
+                            "VPE %s failed: %s",
+                            worker_tag,
                             error,
                             exc_info=True,
                         )
@@ -1845,14 +1641,1199 @@ def _process_vpe_transform_in_background(
 
     except Exception as error:  # noqa: BLE001
         worker_logger.error(
-            "VPE video transform worker failed to initialize: %s",
+            "VPE %s worker failed to initialize: %s",
+            worker_tag,
             error,
             exc_info=True,
         )
 
 
+def _process_vpe_dialogue_in_background(
+    media_item_id: int,
+    request_dto: CreateVeoDto,
+    user_email: str,
+) -> None:
+    """Background worker that generates a dialogue-driven lip-sync video."""
+    _ = user_email
+
+    async def _job(
+        media_repo: MediaRepository,
+        source_asset_repo: SourceAssetRepository,
+        app_gcs: GcsService,
+        vpe_gcs: GcsService,
+        client: VpeClient,
+        work: Path,
+        target_project_id: str | None,
+        worker_logger: logging.Logger,
+    ) -> dict[str, Any]:
+        image_gcs_uri = None
+        if request_dto.start_image_asset_id:
+            image_gcs_uri = await _resolve_asset_ref_uri(
+                request_dto.start_image_asset_id,
+                media_repo,
+                source_asset_repo,
+            )
+        elif request_dto.reference_images:
+            asset = await source_asset_repo.get_by_id(
+                request_dto.reference_images[0].asset_id
+            )
+            if asset:
+                image_gcs_uri = asset.gcs_uri
+        elif request_dto.source_media_items:
+            for smi in request_dto.source_media_items:
+                if smi.role in {
+                    AssetRoleEnum.START_FRAME,
+                    AssetRoleEnum.IMAGE_REFERENCE_ASSET,
+                }:
+                    parent = await media_repo.get_by_id(smi.media_item_id)
+                    if parent and parent.gcs_uris:
+                        image_gcs_uri = parent.gcs_uris[smi.media_index]
+                        break
+
+        if not image_gcs_uri:
+            raise VpeJobError(
+                "No input image could be resolved for dialogue generation."
+            )
+
+        local_raw_image = work / "input_image_raw.png"
+        if not await _download_asset_gcs(
+            image_gcs_uri,
+            local_raw_image,
+            app_gcs,
+            vpe_gcs,
+            fallback_project_id=target_project_id,
+        ):
+            raise VpeJobError(
+                f"Could not download input image {image_gcs_uri}."
+            )
+
+        audio_gcs_uri = await _resolve_asset_ref_uri(
+            request_dto.reference_audio,
+            media_repo,
+            source_asset_repo,
+        )
+        if not audio_gcs_uri:
+            raise VpeJobError(
+                "No audio track could be resolved for dialogue generation."
+            )
+
+        local_raw_audio = work / "input_audio_raw"
+        if not await _download_asset_gcs(
+            audio_gcs_uri,
+            local_raw_audio,
+            app_gcs,
+            vpe_gcs,
+            fallback_project_id=target_project_id,
+        ):
+            raise VpeJobError(
+                f"Could not download reference audio {audio_gcs_uri}."
+            )
+
+        is_portrait = request_dto.aspect_ratio == AspectRatioEnum.RATIO_9_16
+        local_norm_audio = work / "audio_8s.wav"
+        local_norm_frame = work / "frame_1280x720.png"
+        await asyncio.to_thread(
+            prepare_dialogue_audio,
+            local_raw_audio,
+            local_norm_audio,
+        )
+        await asyncio.to_thread(
+            prepare_dialogue_frame,
+            local_raw_image,
+            local_norm_frame,
+            is_portrait=is_portrait,
+        )
+
+        prefix = f"vpe/dialogue/{media_item_id}"
+        staged_frame_uri = await asyncio.to_thread(
+            vpe_gcs.upload_file_to_gcs,
+            local_path=str(local_norm_frame),
+            destination_blob_name=f"{prefix}/frame.png",
+            mime_type=MIME_PNG,
+        )
+        staged_audio_uri = await asyncio.to_thread(
+            vpe_gcs.upload_file_to_gcs,
+            local_path=str(local_norm_audio),
+            destination_blob_name=f"{prefix}/audio_8s.wav",
+            mime_type=MIME_WAV,
+        )
+
+        vpe_req = VpeRequest(
+            capability_id=VpeCapabilityId.DIALOGUE_DRIVEN,
+            storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+            prompt=request_dto.prompt,
+            image=VpeMediaRef(gcs_uri=staged_frame_uri, mime_type=MIME_PNG),
+            reference_audios=(
+                VpeMediaRef(gcs_uri=staged_audio_uri, mime_type=MIME_WAV),
+            ),
+            seed=request_dto.seed,
+            codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+        )
+        result, op_name = await _submit_and_wait_with_retry(
+            client,
+            vpe_req,
+            media_repo,
+            media_item_id,
+            worker_logger,
+        )
+        return await _deliver_gmp_output(
+            result=result,
+            output_codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            dest_prefix=f"generated_videos/dialogue_{media_item_id}",
+            work=work,
+            vpe_gcs=vpe_gcs,
+            app_gcs=app_gcs,
+            base_raw_data={
+                "vpe_capability": VpeCapabilityId.DIALOGUE_DRIVEN.value,
+                "operation": op_name,
+            },
+            preview_postprocess_fn=lambda src, dst: postprocess_dialogue_video(
+                src, dst, is_portrait=is_portrait
+            ),
+        )
+
+    _run_gmp_generation_worker(
+        media_item_id,
+        "dialogue",
+        _job,
+        request_dto.workspace_id,
+    )
+
+
+def _process_vpe_transform_in_background(
+    media_item_id: int,
+    request_dto: CreateVeoDto,
+    user_email: str,
+) -> None:
+    """Background worker for veo-exp-video-transform requests."""
+    _ = user_email
+
+    async def _job(
+        media_repo: MediaRepository,
+        source_asset_repo: SourceAssetRepository,
+        app_gcs: GcsService,
+        vpe_gcs: GcsService,
+        client: VpeClient,
+        work: Path,
+        target_project_id: str | None,
+        worker_logger: logging.Logger,
+    ) -> dict[str, Any]:
+        is_keyframe_i2v = bool(
+            request_dto.start_image_asset_id
+            and not request_dto.source_video_asset_id
+            and not request_dto.edit_source
+            and not (
+                request_dto.source_media_items
+                and any(
+                    item.role == AssetRoleEnum.VIDEO_EXTENSION_SOURCE
+                    for item in request_dto.source_media_items
+                )
+            )
+        )
+        prefix = f"vpe/transform/{media_item_id}"
+        staged_mask_uri = None
+        local_norm_mask = work / "mask_norm.mp4"
+        local_norm_video = work / "norm_video_1280x720.mp4"
+        is_portrait = request_dto.aspect_ratio == AspectRatioEnum.RATIO_9_16
+
+        if is_keyframe_i2v:
+            first_uri = await _resolve_asset_ref_uri(
+                request_dto.start_image_asset_id,
+                media_repo,
+                source_asset_repo,
+            )
+            if not first_uri:
+                raise VpeJobError(
+                    "No first frame image could be resolved for keyframe video"
+                    " transform."
+                )
+            image_ref = await _stage_single_image(
+                uri=first_uri,
+                slot_name="first_frame",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            last_frame_ref = None
+            if request_dto.end_image_asset_id:
+                last_uri = await _resolve_asset_ref_uri(
+                    request_dto.end_image_asset_id,
+                    media_repo,
+                    source_asset_repo,
+                )
+                if last_uri:
+                    last_frame_ref = await _stage_single_image(
+                        uri=last_uri,
+                        slot_name="last_frame",
+                        prefix=prefix,
+                        work=work,
+                        app_gcs=app_gcs,
+                        vpe_gcs=vpe_gcs,
+                        fallback_project_id=target_project_id,
+                    )
+
+            conditioning_frames_list: list[VpeConditioningFrame] = []
+            if request_dto.conditioning_frames:
+                for idx, cf in enumerate(request_dto.conditioning_frames):
+                    cf_uri = await _resolve_asset_ref_uri(
+                        cf.image_asset_id,
+                        media_repo,
+                        source_asset_repo,
+                    )
+                    if cf_uri:
+                        cf_ref = await _stage_single_image(
+                            uri=cf_uri,
+                            slot_name=f"cf_{cf.frame_number}_{idx}",
+                            prefix=prefix,
+                            work=work,
+                            app_gcs=app_gcs,
+                            vpe_gcs=vpe_gcs,
+                            fallback_project_id=target_project_id,
+                        )
+                        conditioning_frames_list.append(
+                            VpeConditioningFrame(
+                                frame_num=cf.frame_number,
+                                image=cf_ref,
+                            )
+                        )
+
+            vpe_req = VpeRequest(
+                capability_id=VpeCapabilityId.VIDEO_TRANSFORM,
+                storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+                prompt=request_dto.prompt,
+                image=image_ref,
+                last_frame=last_frame_ref,
+                conditioning_frames=tuple(conditioning_frames_list),
+                video_transform_strength=None,
+                num_diffusion_steps=request_dto.num_diffusion_steps or 20,
+                seed=request_dto.seed,
+                codec=request_dto.output_codec,
+                compression_quality=request_dto.compression_quality,
+            )
+        else:
+            video_gcs_uri, _ = await _resolve_video_input_uri(
+                request_dto,
+                media_repo,
+                source_asset_repo,
+            )
+            if not video_gcs_uri:
+                raise VpeJobError(
+                    "No input video could be resolved for video transform."
+                )
+            local_raw_video = work / "input_video_raw.mp4"
+            if not await _download_asset_gcs(
+                video_gcs_uri,
+                local_raw_video,
+                app_gcs,
+                vpe_gcs,
+                fallback_project_id=target_project_id,
+            ):
+                raise VpeJobError(
+                    f"Could not download input video {video_gcs_uri}."
+                )
+
+            try:
+                raw_probe = await asyncio.to_thread(
+                    probe_media, str(local_raw_video)
+                )
+                if raw_probe and raw_probe.width and raw_probe.height:
+                    is_portrait = bool(raw_probe.is_portrait)
+            except Exception as probe_err:  # noqa: BLE001
+                worker_logger.warning(
+                    "Could not probe transform input orientation: %s",
+                    probe_err,
+                )
+
+            if request_dto.video_transform_mask_asset_id:
+                mask_gcs_uri = await _resolve_asset_ref_uri(
+                    request_dto.video_transform_mask_asset_id,
+                    media_repo,
+                    source_asset_repo,
+                )
+                if mask_gcs_uri:
+                    local_raw_mask = work / "mask_raw.mp4"
+                    if not await _download_asset_gcs(
+                        mask_gcs_uri,
+                        local_raw_mask,
+                        app_gcs,
+                        vpe_gcs,
+                        fallback_project_id=target_project_id,
+                    ):
+                        raise VpeJobError(
+                            f"Could not download mask video {mask_gcs_uri}."
+                        )
+                    await asyncio.to_thread(
+                        prepare_transform_video,
+                        local_raw_mask,
+                        local_norm_mask,
+                        is_portrait,
+                    )
+                    staged_mask_uri = await asyncio.to_thread(
+                        vpe_gcs.upload_file_to_gcs,
+                        local_path=str(local_norm_mask),
+                        destination_blob_name=f"{prefix}/mask.mp4",
+                        mime_type=_MP4,
+                    )
+
+            await asyncio.to_thread(
+                prepare_transform_video,
+                local_raw_video,
+                local_norm_video,
+                is_portrait,
+            )
+            staged_video_uri = await asyncio.to_thread(
+                vpe_gcs.upload_file_to_gcs,
+                local_path=str(local_norm_video),
+                destination_blob_name=f"{prefix}/input.mp4",
+                mime_type=_MP4,
+            )
+            vpe_req = VpeRequest(
+                capability_id=VpeCapabilityId.VIDEO_TRANSFORM,
+                storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+                prompt=request_dto.prompt,
+                video=VpeMediaRef(gcs_uri=staged_video_uri, mime_type=_MP4),
+                video_transform_strength=(
+                    request_dto.video_transform_strength
+                    if request_dto.video_transform_strength is not None
+                    else 0.5
+                ),
+                num_diffusion_steps=request_dto.num_diffusion_steps or 20,
+                video_transform_mask_gcs_uri=staged_mask_uri,
+                seed=request_dto.seed,
+                codec=request_dto.output_codec,
+                compression_quality=request_dto.compression_quality,
+            )
+
+        result, op_name = await _submit_and_wait_with_retry(
+            client,
+            vpe_req,
+            media_repo,
+            media_item_id,
+            worker_logger,
+        )
+
+        def _postprocess(src: Path, dst: Path) -> Path:
+            to_crop = src
+            if (
+                staged_mask_uri
+                and local_norm_mask.exists()
+                and local_norm_video.exists()
+            ):
+                composited = work / "composited_masked.mp4"
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            str(local_norm_video),
+                            "-i",
+                            str(src),
+                            "-i",
+                            str(local_norm_mask),
+                            "-filter_complex",
+                            "[0:v][1:v][2:v]maskedmerge[outv]",
+                            "-map",
+                            "[outv]",
+                            "-map",
+                            "0:a?",
+                            "-c:v",
+                            "libx264",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-c:a",
+                            "copy",
+                            str(composited),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    to_crop = composited
+                except Exception as comp_err:  # noqa: BLE001
+                    worker_logger.warning(
+                        "Masked compositing fallback: %s", comp_err
+                    )
+            return postprocess_transform_video(to_crop, dst, is_portrait)
+
+        return await _deliver_gmp_output(
+            result=result,
+            output_codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            dest_prefix=f"generated_videos/transform_{media_item_id}",
+            work=work,
+            vpe_gcs=vpe_gcs,
+            app_gcs=app_gcs,
+            base_raw_data={
+                "vpe_capability": VpeCapabilityId.VIDEO_TRANSFORM.value,
+                "vpe_operation": op_name,
+            },
+            preview_postprocess_fn=_postprocess,
+        )
+
+    _run_gmp_generation_worker(
+        media_item_id,
+        "transform",
+        _job,
+        request_dto.workspace_id,
+    )
+
+
+def _process_vpe_perf_estimation_in_background(
+    media_item_id: int,
+    request_dto: CreateVeoDto,
+    user_email: str,
+) -> None:
+    """Background worker for veo-exp-perf-estimation (blue mesh extraction)."""
+    _ = user_email
+
+    async def _job(
+        media_repo: MediaRepository,
+        source_asset_repo: SourceAssetRepository,
+        app_gcs: GcsService,
+        vpe_gcs: GcsService,
+        client: VpeClient,
+        work: Path,
+        target_project_id: str | None,
+        worker_logger: logging.Logger,
+    ) -> dict[str, Any]:
+        video_uri, _ = await _resolve_video_input_uri(
+            request_dto,
+            media_repo,
+            source_asset_repo,
+        )
+        if not video_uri:
+            raise VpeJobError(
+                "No input video could be resolved for performance estimation."
+            )
+
+        local_raw = work / "actor_raw.mp4"
+        if not await _download_asset_gcs(
+            video_uri,
+            local_raw,
+            app_gcs,
+            vpe_gcs,
+            fallback_project_id=target_project_id,
+        ):
+            raise VpeJobError(f"Could not download actor video {video_uri}.")
+
+        max_frames = min(240, int((request_dto.duration_seconds or 10) * 24))
+        local_norm = work / "actor_720p_24fps.mp4"
+        await asyncio.to_thread(
+            normalize_video_720p_24fps,
+            local_raw,
+            local_norm,
+            max_frames,
+        )
+
+        prefix = f"vpe/perf_estimation/{media_item_id}"
+        staged_uri = await asyncio.to_thread(
+            vpe_gcs.upload_file_to_gcs,
+            local_path=str(local_norm),
+            destination_blob_name=f"{prefix}/actor_720p.mp4",
+            mime_type=_MP4,
+        )
+        if not staged_uri:
+            raise VpeJobError(
+                "Could not stage normalized actor video to VPE bucket."
+            )
+
+        vpe_req = VpeRequest(
+            capability_id=VpeCapabilityId.PERF_ESTIMATION,
+            storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+            video=VpeMediaRef(gcs_uri=staged_uri, mime_type=_MP4),
+            seed=request_dto.seed,
+        )
+        result, op_name = await _submit_and_wait_with_retry(
+            client,
+            vpe_req,
+            media_repo,
+            media_item_id,
+            worker_logger,
+            base_raw_data={"is_blue_mesh": True},
+        )
+        return await _deliver_gmp_output(
+            result=result,
+            output_codec="h264",
+            compression_quality="optimized",
+            dest_prefix=f"generated_videos/perf_mesh_{media_item_id}",
+            work=work,
+            vpe_gcs=vpe_gcs,
+            app_gcs=app_gcs,
+            base_raw_data={
+                "vpe_capability": VpeCapabilityId.PERF_ESTIMATION.value,
+                "vpe_operation": op_name,
+                "is_blue_mesh": True,
+            },
+        )
+
+    _run_gmp_generation_worker(
+        media_item_id,
+        "perf_estimation",
+        _job,
+        request_dto.workspace_id,
+    )
+
+
+def _process_vpe_omni_perf_in_background(
+    media_item_id: int,
+    request_dto: CreateVeoDto,
+    user_email: str,
+) -> None:
+    """Background worker for omni-perf (1-step or 2-step via perf-estimation)."""
+    _ = user_email
+
+    async def _job(
+        media_repo: MediaRepository,
+        source_asset_repo: SourceAssetRepository,
+        app_gcs: GcsService,
+        vpe_gcs: GcsService,
+        client: VpeClient,
+        work: Path,
+        target_project_id: str | None,
+        worker_logger: logging.Logger,
+    ) -> dict[str, Any]:
+        driving_uri, is_blue_mesh = await _resolve_video_input_uri(
+            request_dto,
+            media_repo,
+            source_asset_repo,
+        )
+        if not driving_uri:
+            raise VpeJobError(
+                "No driving performance video could be resolved for Omni-Perf."
+            )
+
+        local_raw_driving = work / "driving_raw.mp4"
+        if not await _download_asset_gcs(
+            driving_uri,
+            local_raw_driving,
+            app_gcs,
+            vpe_gcs,
+            fallback_project_id=target_project_id,
+        ):
+            raise VpeJobError(
+                f"Could not download driving video {driving_uri}."
+            )
+
+        max_frames = min(240, int((request_dto.duration_seconds or 10) * 24))
+        local_norm_driving = work / "driving_720p_24fps.mp4"
+        await asyncio.to_thread(
+            normalize_video_720p_24fps,
+            local_raw_driving,
+            local_norm_driving,
+            max_frames,
+        )
+
+        prefix = f"vpe/omni_perf/{media_item_id}"
+        staged_driving_uri = await asyncio.to_thread(
+            vpe_gcs.upload_file_to_gcs,
+            local_path=str(local_norm_driving),
+            destination_blob_name=f"{prefix}/driving_720p.mp4",
+            mime_type=_MP4,
+        )
+        if not staged_driving_uri:
+            raise VpeJobError("Could not stage driving video to VPE bucket.")
+
+        step1_op_name: str | None = None
+        if not is_blue_mesh:
+            mesh_req = VpeRequest(
+                capability_id=VpeCapabilityId.PERF_ESTIMATION,
+                storage_uri=(
+                    f"gs://{config_service.VPE_BUCKET}/{prefix}/mesh_out"
+                ),
+                video=VpeMediaRef(gcs_uri=staged_driving_uri, mime_type=_MP4),
+                seed=request_dto.seed,
+            )
+            mesh_res, step1_op_name = await _submit_and_wait_with_retry(
+                client,
+                mesh_req,
+                media_repo,
+                media_item_id,
+                worker_logger,
+                base_raw_data={"stage": "perf_estimation"},
+            )
+            mesh_uri = mesh_res.primary_video.gcs_uri
+            mesh_mime = mesh_res.primary_video.mime_type or _MP4
+        else:
+            mesh_uri = staged_driving_uri
+            mesh_mime = _MP4
+
+        staged_refs = await _collect_and_stage_reference_images(
+            request_dto=request_dto,
+            prefix=prefix,
+            work=work,
+            media_repo=media_repo,
+            source_asset_repo=source_asset_repo,
+            app_gcs=app_gcs,
+            vpe_gcs=vpe_gcs,
+            fallback_project_id=target_project_id,
+            max_items=5,
+        )
+        if not staged_refs:
+            raise VpeJobError(
+                "Omni-Perf requires at least one character reference image."
+            )
+
+        audio_control: VpeAudioControl | None = None
+        if request_dto.audio_control_mode == "target_audio":
+            audio_uris = await _resolve_audio_uris(
+                request_dto, media_repo, source_asset_repo, max_items=1
+            )
+            if not audio_uris:
+                raise VpeJobError(
+                    "audio_control_mode 'target_audio' requires a reference"
+                    " audio track."
+                )
+            audio_ref = await _stage_audio_file(
+                uri=audio_uris[0],
+                slot_name="target_audio",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            audio_control = VpeAudioControl(target_audio=audio_ref)
+        elif request_dto.audio_control_mode == "preserve_video_audio":
+            if not is_blue_mesh:
+                extracted_wav = await asyncio.to_thread(
+                    extract_audio_wav,
+                    local_raw_driving,
+                    work / "actor_extracted.wav",
+                )
+                if extracted_wav is not None:
+                    staged_wav_uri = await asyncio.to_thread(
+                        vpe_gcs.upload_file_to_gcs,
+                        local_path=str(extracted_wav),
+                        destination_blob_name=f"{prefix}/actor_audio.wav",
+                        mime_type=MIME_WAV,
+                    )
+                    if staged_wav_uri:
+                        audio_control = VpeAudioControl(
+                            target_audio=VpeMediaRef(
+                                gcs_uri=staged_wav_uri,
+                                mime_type=MIME_WAV,
+                            )
+                        )
+            else:
+                audio_control = VpeAudioControl(
+                    use_target_audio_from_video=True
+                )
+
+        vpe_req = VpeRequest(
+            capability_id=VpeCapabilityId.OMNI_PERF,
+            storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+            prompt=request_dto.prompt,
+            video=VpeMediaRef(gcs_uri=mesh_uri, mime_type=mesh_mime),
+            reference_images=staged_refs,
+            codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            audio_control=audio_control,
+        )
+        base_raw: dict[str, Any] = {"blue_mesh_gcs_uri": mesh_uri}
+        if step1_op_name:
+            base_raw["perf_estimation_operation"] = step1_op_name
+
+        result, op_name = await _submit_and_wait_with_retry(
+            client,
+            vpe_req,
+            media_repo,
+            media_item_id,
+            worker_logger,
+            base_raw_data=base_raw,
+        )
+        return await _deliver_gmp_output(
+            result=result,
+            output_codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            dest_prefix=f"generated_videos/omni_perf_{media_item_id}",
+            work=work,
+            vpe_gcs=vpe_gcs,
+            app_gcs=app_gcs,
+            base_raw_data={
+                **base_raw,
+                "vpe_capability": VpeCapabilityId.OMNI_PERF.value,
+                "vpe_operation": op_name,
+            },
+        )
+
+    _run_gmp_generation_worker(
+        media_item_id,
+        "omni_perf",
+        _job,
+        request_dto.workspace_id,
+    )
+
+
+def _process_vpe_omni_cine_in_background(
+    media_item_id: int,
+    request_dto: CreateVeoDto,
+    user_email: str,
+) -> None:
+    """Background worker for omni-cine (T2V, I2V, R2V, videoTransform, audio)."""
+    _ = user_email
+
+    async def _job(
+        media_repo: MediaRepository,
+        source_asset_repo: SourceAssetRepository,
+        app_gcs: GcsService,
+        vpe_gcs: GcsService,
+        client: VpeClient,
+        work: Path,
+        target_project_id: str | None,
+        worker_logger: logging.Logger,
+    ) -> dict[str, Any]:
+        prefix = f"vpe/omni_cine/{media_item_id}"
+        max_frames = min(240, int((request_dto.duration_seconds or 10) * 24))
+
+        # 1. Optional start & end frames
+        start_uri = await _resolve_asset_ref_uri(
+            request_dto.start_image_asset_id,
+            media_repo,
+            source_asset_repo,
+        )
+        end_uri = await _resolve_asset_ref_uri(
+            request_dto.end_image_asset_id,
+            media_repo,
+            source_asset_repo,
+        )
+        if not start_uri and request_dto.source_media_items:
+            for smi in request_dto.source_media_items:
+                if smi.role == AssetRoleEnum.START_FRAME:
+                    parent = await media_repo.get_by_id(smi.media_item_id)
+                    if parent and parent.gcs_uris:
+                        start_uri = parent.gcs_uris[smi.media_index]
+                        break
+        if not end_uri and request_dto.source_media_items:
+            for smi in request_dto.source_media_items:
+                if smi.role == AssetRoleEnum.END_FRAME:
+                    parent = await media_repo.get_by_id(smi.media_item_id)
+                    if parent and parent.gcs_uris:
+                        end_uri = parent.gcs_uris[smi.media_index]
+                        break
+
+        image_ref = (
+            await _stage_single_image(
+                uri=start_uri,
+                slot_name="first_frame",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            if start_uri
+            else None
+        )
+        last_frame_ref = (
+            await _stage_single_image(
+                uri=end_uri,
+                slot_name="last_frame",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            if end_uri
+            else None
+        )
+
+        # 2. Optional reference images (up to 7)
+        staged_refs = await _collect_and_stage_reference_images(
+            request_dto=request_dto,
+            prefix=prefix,
+            work=work,
+            media_repo=media_repo,
+            source_asset_repo=source_asset_repo,
+            app_gcs=app_gcs,
+            vpe_gcs=vpe_gcs,
+            fallback_project_id=target_project_id,
+            max_items=7,
+        )
+
+        # 3. Optional videoTransform (edit_source) or input video
+        omni_video_transform: VpeOmniVideoTransform | None = None
+        video_ref: VpeMediaRef | None = None
+        local_raw_source_video: Path | None = None
+
+        edit_uri = await _resolve_asset_ref_uri(
+            request_dto.edit_source,
+            media_repo,
+            source_asset_repo,
+        )
+        if not edit_uri and request_dto.source_media_items:
+            for smi in request_dto.source_media_items:
+                if smi.role == AssetRoleEnum.EDIT_SOURCE:
+                    parent = await media_repo.get_by_id(smi.media_item_id)
+                    if parent and parent.gcs_uris:
+                        edit_uri = parent.gcs_uris[smi.media_index]
+                        break
+
+        if edit_uri:
+            local_raw_source_video = work / "edit_raw.mp4"
+            if not await _download_asset_gcs(
+                edit_uri,
+                local_raw_source_video,
+                app_gcs,
+                vpe_gcs,
+                fallback_project_id=target_project_id,
+            ):
+                raise VpeJobError(
+                    f"Could not download edit_source video {edit_uri}."
+                )
+            local_norm_edit = work / "edit_720p_24fps.mp4"
+            await asyncio.to_thread(
+                normalize_video_720p_24fps,
+                local_raw_source_video,
+                local_norm_edit,
+                max_frames,
+            )
+            staged_edit_uri = await asyncio.to_thread(
+                vpe_gcs.upload_file_to_gcs,
+                local_path=str(local_norm_edit),
+                destination_blob_name=f"{prefix}/init_video.mp4",
+                mime_type=_MP4,
+            )
+            if not staged_edit_uri:
+                raise VpeJobError(
+                    "Could not stage initializationVideo to VPE bucket."
+                )
+
+            mask_ref: VpeMediaRef | None = None
+            if request_dto.video_transform_mask_asset_id:
+                mask_uri = await _resolve_asset_ref_uri(
+                    request_dto.video_transform_mask_asset_id,
+                    media_repo,
+                    source_asset_repo,
+                )
+                if mask_uri:
+                    local_raw_mask = work / "mask_raw.mp4"
+                    if not await _download_asset_gcs(
+                        mask_uri,
+                        local_raw_mask,
+                        app_gcs,
+                        vpe_gcs,
+                        fallback_project_id=target_project_id,
+                    ):
+                        raise VpeJobError(
+                            f"Could not download mask video {mask_uri}."
+                        )
+                    local_norm_mask = work / "mask_720p_24fps.mp4"
+                    await asyncio.to_thread(
+                        normalize_video_720p_24fps,
+                        local_raw_mask,
+                        local_norm_mask,
+                        max_frames,
+                    )
+                    staged_mask_uri = await asyncio.to_thread(
+                        vpe_gcs.upload_file_to_gcs,
+                        local_path=str(local_norm_mask),
+                        destination_blob_name=f"{prefix}/mask_video.mp4",
+                        mime_type=_MP4,
+                    )
+                    if staged_mask_uri:
+                        mask_ref = VpeMediaRef(
+                            gcs_uri=staged_mask_uri,
+                            mime_type=_MP4,
+                        )
+
+            noise_strength = (
+                request_dto.video_transform_strength
+                if request_dto.video_transform_strength is not None
+                else 0.95
+            )
+            omni_video_transform = VpeOmniVideoTransform(
+                initialization_video=VpeMediaRef(
+                    gcs_uri=staged_edit_uri,
+                    mime_type=_MP4,
+                ),
+                noise_strength=noise_strength,
+                mask=mask_ref,
+            )
+        else:
+            other_video_uri, _ = await _resolve_video_input_uri(
+                request_dto,
+                media_repo,
+                source_asset_repo,
+            )
+            if other_video_uri:
+                local_raw_source_video = work / "input_raw.mp4"
+                if not await _download_asset_gcs(
+                    other_video_uri,
+                    local_raw_source_video,
+                    app_gcs,
+                    vpe_gcs,
+                    fallback_project_id=target_project_id,
+                ):
+                    raise VpeJobError(
+                        f"Could not download input video {other_video_uri}."
+                    )
+                local_norm_in = work / "input_720p_24fps.mp4"
+                await asyncio.to_thread(
+                    normalize_video_720p_24fps,
+                    local_raw_source_video,
+                    local_norm_in,
+                    max_frames,
+                )
+                staged_in_uri = await asyncio.to_thread(
+                    vpe_gcs.upload_file_to_gcs,
+                    local_path=str(local_norm_in),
+                    destination_blob_name=f"{prefix}/input_video.mp4",
+                    mime_type=_MP4,
+                )
+                if staged_in_uri:
+                    video_ref = VpeMediaRef(
+                        gcs_uri=staged_in_uri,
+                        mime_type=_MP4,
+                    )
+
+        # 4. Audio steering (referenceAudios vs audioControl)
+        reference_audios: tuple[VpeMediaRef, ...] = ()
+        audio_control: VpeAudioControl | None = None
+        audio_uris = await _resolve_audio_uris(
+            request_dto,
+            media_repo,
+            source_asset_repo,
+            max_items=3,
+        )
+
+        if request_dto.audio_control_mode == "target_audio":
+            if not audio_uris:
+                raise VpeJobError(
+                    "Omni-Cine audio_control_mode 'target_audio' requires"
+                    " reference_audio."
+                )
+            staged_target = await _stage_audio_file(
+                uri=audio_uris[0],
+                slot_name="target_audio",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            audio_control = VpeAudioControl(target_audio=staged_target)
+        elif request_dto.audio_control_mode == "preserve_video_audio":
+            if video_ref is not None:
+                audio_control = VpeAudioControl(
+                    use_target_audio_from_video=True
+                )
+            elif local_raw_source_video is not None:
+                extracted_wav = await asyncio.to_thread(
+                    extract_audio_wav,
+                    local_raw_source_video,
+                    work / "source_audio.wav",
+                )
+                if extracted_wav is not None:
+                    staged_wav_uri = await asyncio.to_thread(
+                        vpe_gcs.upload_file_to_gcs,
+                        local_path=str(extracted_wav),
+                        destination_blob_name=f"{prefix}/source_audio.wav",
+                        mime_type=MIME_WAV,
+                    )
+                    if staged_wav_uri:
+                        audio_control = VpeAudioControl(
+                            target_audio=VpeMediaRef(
+                                gcs_uri=staged_wav_uri,
+                                mime_type=MIME_WAV,
+                            )
+                        )
+        elif request_dto.audio_control_mode == "reference_audio" or (
+            audio_uris and request_dto.audio_control_mode is None
+        ):
+            staged_audio_list: list[VpeMediaRef] = []
+            for idx, a_uri in enumerate(audio_uris[:3]):
+                staged_audio_list.append(
+                    await _stage_audio_file(
+                        uri=a_uri,
+                        slot_name=f"ref_audio_{idx:02d}",
+                        prefix=prefix,
+                        work=work,
+                        app_gcs=app_gcs,
+                        vpe_gcs=vpe_gcs,
+                        fallback_project_id=target_project_id,
+                    )
+                )
+            reference_audios = tuple(staged_audio_list)
+
+        vpe_req = VpeRequest(
+            capability_id=VpeCapabilityId.OMNI_CINE,
+            storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+            prompt=request_dto.prompt,
+            video=video_ref,
+            image=image_ref,
+            last_frame=last_frame_ref,
+            reference_images=staged_refs,
+            reference_audios=reference_audios,
+            codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            omni_video_transform=omni_video_transform,
+            audio_control=audio_control,
+        )
+        result, op_name = await _submit_and_wait_with_retry(
+            client,
+            vpe_req,
+            media_repo,
+            media_item_id,
+            worker_logger,
+        )
+        return await _deliver_gmp_output(
+            result=result,
+            output_codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            dest_prefix=f"generated_videos/omni_cine_{media_item_id}",
+            work=work,
+            vpe_gcs=vpe_gcs,
+            app_gcs=app_gcs,
+            base_raw_data={
+                "vpe_capability": VpeCapabilityId.OMNI_CINE.value,
+                "vpe_operation": op_name,
+            },
+        )
+
+    _run_gmp_generation_worker(
+        media_item_id,
+        "omni_cine",
+        _job,
+        request_dto.workspace_id,
+    )
+
+
+def _process_vpe_video_textures_in_background(
+    media_item_id: int,
+    request_dto: CreateVeoDto,
+    user_email: str,
+) -> None:
+    """Background worker for veo-exp-video-textures (seamless loop & tiling)."""
+    _ = user_email
+
+    async def _job(
+        media_repo: MediaRepository,
+        source_asset_repo: SourceAssetRepository,
+        app_gcs: GcsService,
+        vpe_gcs: GcsService,
+        client: VpeClient,
+        work: Path,
+        target_project_id: str | None,
+        worker_logger: logging.Logger,
+    ) -> dict[str, Any]:
+        prefix = f"vpe/video_textures/{media_item_id}"
+
+        start_uri = await _resolve_asset_ref_uri(
+            request_dto.start_image_asset_id,
+            media_repo,
+            source_asset_repo,
+        )
+        end_uri = await _resolve_asset_ref_uri(
+            request_dto.end_image_asset_id,
+            media_repo,
+            source_asset_repo,
+        )
+        if not start_uri and request_dto.source_media_items:
+            for smi in request_dto.source_media_items:
+                if smi.role == AssetRoleEnum.START_FRAME:
+                    parent = await media_repo.get_by_id(smi.media_item_id)
+                    if parent and parent.gcs_uris:
+                        start_uri = parent.gcs_uris[smi.media_index]
+                        break
+        if not end_uri and request_dto.source_media_items:
+            for smi in request_dto.source_media_items:
+                if smi.role == AssetRoleEnum.END_FRAME:
+                    parent = await media_repo.get_by_id(smi.media_item_id)
+                    if parent and parent.gcs_uris:
+                        end_uri = parent.gcs_uris[smi.media_index]
+                        break
+
+        image_ref = (
+            await _stage_single_image(
+                uri=start_uri,
+                slot_name="start_frame",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            if start_uri
+            else None
+        )
+        last_frame_ref = (
+            await _stage_single_image(
+                uri=end_uri,
+                slot_name="last_frame",
+                prefix=prefix,
+                work=work,
+                app_gcs=app_gcs,
+                vpe_gcs=vpe_gcs,
+                fallback_project_id=target_project_id,
+            )
+            if end_uri
+            else None
+        )
+
+        seamless_flags = VpeSeamlessFlags(
+            loop=request_dto.seamless_loop,
+            tessellate_horizontal=request_dto.tessellate_horizontal,
+            tessellate_vertical=request_dto.tessellate_vertical,
+        )
+        seamless_dict = {
+            "loop": request_dto.seamless_loop,
+            "tessellate_horizontal": request_dto.tessellate_horizontal,
+            "tessellate_vertical": request_dto.tessellate_vertical,
+        }
+
+        vpe_req = VpeRequest(
+            capability_id=VpeCapabilityId.VIDEO_TEXTURES,
+            storage_uri=f"gs://{config_service.VPE_BUCKET}/{prefix}/out",
+            prompt=(
+                request_dto.prompt
+                if request_dto.prompt and request_dto.prompt.strip()
+                else None
+            ),
+            image=image_ref,
+            last_frame=last_frame_ref,
+            seamless=seamless_flags,
+            seed=request_dto.seed,
+            codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+        )
+        result, op_name = await _submit_and_wait_with_retry(
+            client,
+            vpe_req,
+            media_repo,
+            media_item_id,
+            worker_logger,
+            base_raw_data={"seamless": seamless_dict},
+        )
+        return await _deliver_gmp_output(
+            result=result,
+            output_codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            dest_prefix=f"generated_videos/textures_{media_item_id}",
+            work=work,
+            vpe_gcs=vpe_gcs,
+            app_gcs=app_gcs,
+            base_raw_data={
+                "vpe_capability": VpeCapabilityId.VIDEO_TEXTURES.value,
+                "vpe_operation": op_name,
+                "seamless": seamless_dict,
+            },
+        )
+
+    _run_gmp_generation_worker(
+        media_item_id,
+        "video_textures",
+        _job,
+        request_dto.workspace_id,
+    )
+
+
 class VpeService:
-    """Application-facing entry points for VPE capabilities."""
+    """Application-facing entry points for VPE / GMP capabilities."""
 
     def __init__(
         self,
@@ -1861,14 +2842,7 @@ class VpeService:
         gcs_service: GcsService = Depends(),
         iam_signer: IamSignerCredentials = Depends(),
     ):
-        """Initializes the service with its dependencies.
-
-        Args:
-            media_repo: Repository owning gallery rows.
-            source_asset_repo: Repository owning source/template asset rows.
-            gcs_service: Storage service for the application's own bucket.
-            iam_signer: Signer service for generating presigned URLs.
-        """
+        """Initializes the service with its dependencies."""
         self.media_repo = media_repo
         self.source_asset_repo = source_asset_repo
         self.gcs_service = gcs_service
@@ -1879,27 +2853,15 @@ class VpeService:
         media_item_id: int,
         capability_id: VpeCapabilityId = VpeCapabilityId.UPSCALE,
     ) -> VpeScreeningResult:
-        """Judges a gallery row against a capability without downloading it.
-
-        Cheap enough to call while drawing a menu. It can only ever rule a
-        capability out: the row stores duration and a resolution *name*, and
-        the upscaler validates a frame rate the row does not carry and an
-        exact pixel size the name cannot confirm.
-
-        Args:
-            media_item_id: The row to screen.
-            capability_id: The capability to screen against.
-
-        Returns:
-            The screening outcome and the findings behind it.
-
-        Raises:
-            HTTPException: If the row does not exist or is not a video.
-        """
+        """Judges a gallery row against a capability without downloading it."""
         item = await self.media_repo.get_by_id(media_item_id)
+        raw_data: dict[str, Any] | None = None
         if item and item.mime_type == MimeTypeEnum.VIDEO_MP4:
             duration_seconds = item.duration_seconds
             resolution = item.resolution
+            candidate_raw = getattr(item, "raw_data", None)
+            if isinstance(candidate_raw, dict):
+                raw_data = candidate_raw
         else:
             source_asset = await self.source_asset_repo.get_by_id(media_item_id)
             if (
@@ -1916,15 +2878,23 @@ class VpeService:
                     ),
                 )
 
+        if capability_id in (
+            VpeCapabilityId.UPSCALE,
+            VpeCapabilityId.SUPER_RES,
+        ):
+            return screen_upscale_candidate(
+                duration_seconds=duration_seconds,
+                resolution=resolution,
+                raw_data=raw_data,
+                max_segments=MAX_SEGMENTS_PER_JOB,
+                capability_id=capability_id,
+            )
+
         return screen_stored_video(
             get_capability(capability_id),
             duration_seconds=duration_seconds,
             resolution=resolution,
-            max_segments=(
-                MAX_SEGMENTS_PER_JOB
-                if capability_id == VpeCapabilityId.UPSCALE
-                else 1
-            ),
+            max_segments=1,
         )
 
     async def start_upscale_job(
@@ -1933,27 +2903,14 @@ class VpeService:
         user: UserModel,
         executor: ThreadPoolExecutor,
     ) -> MediaItemResponse:
-        """Creates a placeholder row and queues the upscale behind it.
-
-        Args:
-            request_dto: The validated request.
-            user: The user the new row belongs to.
-            executor: VPE's own thread pool.
-
-        Returns:
-            The placeholder row, already visible in the gallery as
-            processing.
-
-        Raises:
-            HTTPException: If VPE is unavailable, or the source row is
-                missing, not a video, or already ruled out.
-        """
+        """Creates a placeholder row and queues the upscale behind it."""
         try:
             require_vpe_configured(config_service)
         except VpeJobError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
         item = await self.media_repo.get_by_id(request_dto.media_item_id)
+        parent_raw_data: dict[str, Any] | None = None
         if item and item.mime_type == MimeTypeEnum.VIDEO_MP4:
             if not item.gcs_uris or request_dto.media_index >= len(
                 item.gcs_uris
@@ -1969,6 +2926,9 @@ class VpeService:
             duration_seconds = item.duration_seconds
             resolution = item.resolution
             aspect_ratio = item.aspect_ratio
+            candidate_raw = getattr(item, "raw_data", None)
+            if isinstance(candidate_raw, dict):
+                parent_raw_data = candidate_raw
         else:
             source_asset = await self.source_asset_repo.get_by_id(
                 request_dto.media_item_id
@@ -1980,8 +2940,8 @@ class VpeService:
                 raise HTTPException(
                     status_code=404,
                     detail=(
-                        f"Video asset '{request_dto.media_item_id}' not found or is"
-                        " not a video."
+                        f"Video asset '{request_dto.media_item_id}' not found"
+                        " or is not a video."
                     ),
                 )
             source_gcs_uri = source_asset.gcs_uri
@@ -1989,16 +2949,12 @@ class VpeService:
             resolution = None
             aspect_ratio = source_asset.aspect_ratio
 
-        # The screening here is the same one the gallery used to decide
-        # whether to offer the action. Repeating it costs a comparison and
-        # catches the case where the row changed, or the caller never asked.
-        # It cannot replace the worker's own preflight: the row does not
-        # record a frame rate.
-        screening = screen_stored_video(
-            get_capability(VpeCapabilityId.UPSCALE),
+        screening = screen_upscale_candidate(
             duration_seconds=duration_seconds,
             resolution=resolution,
+            raw_data=parent_raw_data,
             max_segments=MAX_SEGMENTS_PER_JOB,
+            capability_id=VpeCapabilityId.UPSCALE,
         )
         if not screening.offer:
             raise HTTPException(
@@ -2008,15 +2964,37 @@ class VpeService:
                 ),
             )
 
+        resolved_mode = request_dto.resolved_mode
+        if (
+            screening.supported_modes
+            and resolved_mode not in screening.supported_modes
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Upscale mode '{resolved_mode}' is not supported for this"
+                    f" video. Supported modes: {list(screening.supported_modes)}."
+                ),
+            )
+
+        uses_super_res = (
+            not is_seamless_raw_data(parent_raw_data)
+            and resolved_mode in _SUPER_RES_MODE_MAP
+            and (duration_seconds is None or duration_seconds <= 10.05)
+        )
+        placeholder_model = (
+            GenerationModelEnum.VEO_EXP_SUPER_RES
+            if uses_super_res
+            else GenerationModelEnum.VEO_3_1_UPSCALE
+        )
+
         placeholder_item = MediaItemModel(
             workspace_id=request_dto.workspace_id,
             user_email=user.email,
             user_id=user.id,
             mime_type=MimeTypeEnum.VIDEO_MP4,
-            model=GenerationModelEnum.VEO_3_1_UPSCALE,
-            original_prompt=(
-                f"Upscale to {request_dto.resolution.value.upper()}"
-            ),
+            model=placeholder_model,
+            original_prompt=f"Upscale to {resolved_mode.upper()}",
             status=JobStatusEnum.PROCESSING,
             source_media_items=[
                 SourceMediaItemLink(
@@ -2039,6 +3017,12 @@ class VpeService:
             resolution=request_dto.resolution,
             sharpness=request_dto.sharpness,
             workspace_id=request_dto.workspace_id,
+            upscale_mode=resolved_mode,
+            steps=request_dto.steps,
+            seed=request_dto.seed,
+            output_codec=request_dto.output_codec,
+            compression_quality=request_dto.compression_quality,
+            parent_raw_data=parent_raw_data,
         )
         logger.info("VPE upscale job queued: %s", placeholder_item.id)
 

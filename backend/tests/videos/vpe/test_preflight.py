@@ -741,15 +741,24 @@ def test_over_length_clip_states_measured_and_required_length():
 def test_exact_length_models_say_exactly():
     verdict = preflight_media(
         _corpus("landscape_240"),
-        VpeCapabilityId.PERF_ESTIMATION,
+        VpeCapabilityId.PERF_GENERATION,
     )
     finding = _finding(verdict, VpeReasonCode.FRAME_COUNT_TOO_HIGH)
     assert "10s (240 frames)" in finding.message
     assert "exactly 8s (192 frames)" in finding.message
 
 
+def test_240_frames_is_in_spec_for_perf_estimation():
+    verdict = preflight_media(
+        _corpus("landscape_240_silent"),
+        VpeCapabilityId.PERF_ESTIMATION,
+    )
+    assert verdict.severity is VpeSeverity.OK
+    assert verdict.findings == ()
+
+
 def test_240_frames_is_in_spec_for_omni_cine():
-    """Omni-Cine is the only capability that takes more than 192 frames."""
+    """Omni-Cine accepts up to 240 frames (10s @ 24fps)."""
     verdict = preflight_media(
         _corpus("landscape_240_silent"),
         VpeCapabilityId.OMNI_CINE,
@@ -758,14 +767,14 @@ def test_240_frames_is_in_spec_for_omni_cine():
     assert verdict.findings == ()
 
 
-def test_omni_cine_warns_that_it_ignores_a_source_audio_track():
+def test_omni_cine_warns_about_default_source_audio_replacement():
     verdict = preflight_media(
         _corpus("landscape_240"),
         VpeCapabilityId.OMNI_CINE,
     )
     assert not verdict.is_blocked
-    finding = _finding(verdict, VpeReasonCode.AUDIO_INPUT_UNSUPPORTED)
-    assert "does not accept audio input" in finding.message
+    finding = _finding(verdict, VpeReasonCode.SOURCE_AUDIO_NOT_PRESERVED)
+    assert finding.severity is VpeSeverity.WARN
 
 
 def test_performance_generation_calls_its_video_the_blue_mesh():
@@ -810,6 +819,21 @@ def test_thirty_fps_is_blocked_with_both_numbers(fixtures):
     assert "30 fps" in finding.message
     assert "exactly 24 fps" in finding.message
     assert "24 fps" in finding.remedy
+
+
+def test_super_res_accepts_thirty_fps_and_preserves_audio(fixtures):
+    verdict_fps = validate(
+        _probe(fixtures, "thirty_fps.mp4"),
+        VpeCapabilityId.SUPER_RES,
+    )
+    assert not verdict_fps.has(VpeReasonCode.FPS_MISMATCH)
+
+    verdict_audio = validate(
+        _probe(fixtures, "landscape_120_audio.mp4"),
+        VpeCapabilityId.SUPER_RES,
+    )
+    assert verdict_audio.severity is VpeSeverity.OK
+    assert not verdict_audio.has(VpeReasonCode.SOURCE_AUDIO_NOT_PRESERVED)
 
 
 def test_23_976_fps_is_blocked_and_named_as_a_rational(fixtures):
@@ -992,13 +1016,19 @@ def test_aac_audio_warns_that_it_has_no_documented_mime_type(fixtures):
     assert "audio/wav" in finding.message
 
 
-def test_audio_is_blocked_for_a_model_that_cannot_take_it(fixtures):
-    verdict = validate(
+def test_audio_passes_omni_cine_and_is_blocked_where_unsupported(fixtures):
+    omni_verdict = validate(
         _probe(fixtures, "speech_8s.wav"),
         VpeCapabilityId.OMNI_CINE,
     )
-    finding = _finding(verdict, VpeReasonCode.MEDIA_KIND_UNSUPPORTED)
-    assert "Audio input is explicitly unsupported" in finding.message
+    assert omni_verdict.severity is VpeSeverity.OK
+
+    blocked = validate(
+        _probe(fixtures, "speech_8s.wav"),
+        VpeCapabilityId.VIDEO_TRANSFORM,
+    )
+    finding = _finding(blocked, VpeReasonCode.MEDIA_KIND_UNSUPPORTED)
+    assert finding.severity is VpeSeverity.BLOCK
 
 
 def test_generated_clip_with_audio_warns_about_the_lost_track(fixtures):

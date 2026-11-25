@@ -16,7 +16,7 @@
 
 <div class="upscale-dialog-container glass-morphism">
   <div class="dialog-header">
-    <h2 class="dialog-title">Upscale Video</h2>
+    <h2 class="dialog-title">Upscale &amp; Super Resolution</h2>
     <p class="dialog-subtitle">
       Splits and upscales the clip if needed, then rejoins it with the
       original audio. This can take several minutes.
@@ -25,11 +25,29 @@
 
   <div class="dialog-content">
     <div class="field">
-      <span class="field-label">Resolution</span>
+      <span class="field-label">Upscale Mode</span>
       <studio-dropdown
-        [options]="resolutionOptions"
-        [value]="resolution"
-        (valueChange)="onResolutionChange($event)"
+        [options]="modeOptions"
+        [value]="upscaleMode"
+        (valueChange)="onModeChange($event)"
+      ></studio-dropdown>
+    </div>
+
+    <div class="field" *ngIf="isSuperResolution">
+      <span class="field-label">Refinement Steps</span>
+      <studio-dropdown
+        [options]="stepOptions"
+        [value]="steps"
+        (valueChange)="onStepsChange($event)"
+      ></studio-dropdown>
+    </div>
+
+    <div class="field">
+      <span class="field-label">Delivery Format</span>
+      <studio-dropdown
+        [options]="deliveryFormatOptions"
+        [value]="deliveryFormat"
+        (valueChange)="onDeliveryFormatChange($event)"
       ></studio-dropdown>
     </div>
 

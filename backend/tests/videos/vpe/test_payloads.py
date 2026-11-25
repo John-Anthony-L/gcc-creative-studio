@@ -42,8 +42,10 @@ from src.videos.vpe.capabilities import (
     get_capability,
 )
 from src.videos.vpe.payloads import (
+    VpeAudioControl,
     VpeConditioningFrame,
     VpeMediaRef,
+    VpeOmniVideoTransform,
     VpePayloadError,
     VpeRequest,
     VpeSeamlessFlags,
@@ -819,6 +821,11 @@ def test_doc_sample_video_textures_2_tessellation_only_i2v():
 
 MP4 = VpeMediaRef(gcs_uri=f"{BUCKET}/in/clip.mp4", mime_type="video/mp4")
 PNG = VpeMediaRef(gcs_uri=f"{BUCKET}/in/still.png", mime_type="image/png")
+WEBP = VpeMediaRef(gcs_uri=f"{BUCKET}/in/still.webp", mime_type="image/webp")
+EXR_SEQ = VpeMediaRef(
+    gcs_uri=f"{BUCKET}/in/frames/*.exr",
+    mime_type="image/x-exr",
+)
 WAV = VpeMediaRef(gcs_uri=f"{BUCKET}/in/line.wav", mime_type="audio/wav")
 MESH = f"{BUCKET}/out/bluemesh.mp4"
 
@@ -838,6 +845,12 @@ MINIMAL_REQUESTS: dict[VpeCapabilityId, VpeRequest] = {
         # minimal, it is invalid.
         compression_quality="lossless_16bit_png",
     ),
+    VpeCapabilityId.SUPER_RES: VpeRequest(
+        capability_id=VpeCapabilityId.SUPER_RES,
+        storage_uri=OUTPUT_DIR,
+        video=MP4,
+        super_res_mode="MODE_4K",
+    ),
     VpeCapabilityId.OMNI_CINE: VpeRequest(
         capability_id=VpeCapabilityId.OMNI_CINE,
         storage_uri=OUTPUT_DIR,
@@ -853,6 +866,13 @@ MINIMAL_REQUESTS: dict[VpeCapabilityId, VpeRequest] = {
         capability_id=VpeCapabilityId.PERF_ESTIMATION,
         storage_uri=OUTPUT_DIR,
         video=MP4,
+    ),
+    VpeCapabilityId.OMNI_PERF: VpeRequest(
+        capability_id=VpeCapabilityId.OMNI_PERF,
+        storage_uri=OUTPUT_DIR,
+        prompt="A prompt",
+        video=MP4,
+        reference_images=(PNG,),
     ),
     VpeCapabilityId.PERF_GENERATION: VpeRequest(
         capability_id=VpeCapabilityId.PERF_GENERATION,
@@ -884,6 +904,7 @@ PARAMETER_ATTRIBUTES: dict[tuple[str, VpeParameterLocation], str | None] = {
     ("task", VpeParameterLocation.PARAMETERS): None,
     ("modelName", VpeParameterLocation.EXPERIMENTS): None,
     ("seed", VpeParameterLocation.PARAMETERS): "seed",
+    ("fps", VpeParameterLocation.PARAMETERS): "fps",
     ("compressionQuality", VpeParameterLocation.PARAMETERS): (
         "compression_quality"
     ),
@@ -911,12 +932,40 @@ PARAMETER_ATTRIBUTES: dict[tuple[str, VpeParameterLocation], str | None] = {
     ("tessellateVertical", VpeParameterLocation.EXPERIMENTS_SEAMLESS): (
         "seamless"
     ),
+    ("mode", VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES): (
+        "super_res_mode"
+    ),
+    ("steps", VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES): (
+        "super_res_steps"
+    ),
+    ("exrColorSpaceOverride", VpeParameterLocation.EXPERIMENTS_CUSTOM): (
+        "exr_color_space_override"
+    ),
+    (
+        "initializationVideo",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM,
+    ): "omni_video_transform",
+    (
+        "noiseStrength",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM,
+    ): "omni_video_transform",
+    ("mask", VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM): (
+        "omni_video_transform"
+    ),
+    ("targetAudio", VpeParameterLocation.EXPERIMENTS_CUSTOM_AUDIO_CONTROL): (
+        "audio_control"
+    ),
+    (
+        "useTargetAudioFromVideo",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_AUDIO_CONTROL,
+    ): "audio_control",
 }
 
 # A legal value for every optional request field, chosen so that one value
 # satisfies every capability that accepts the field.
 MAXIMAL_VALUES: dict[str, Any] = {
     "seed": 42,
+    "fps": 30,
     "compression_quality": "lossless",
     "resolution": "4k",
     "aspect_ratio": "16:9",
@@ -932,6 +981,15 @@ MAXIMAL_VALUES: dict[str, Any] = {
         tessellate_horizontal=True,
         tessellate_vertical=True,
     ),
+    "super_res_mode": "MODE_4K_PRO",
+    "super_res_steps": 2,
+    "exr_color_space_override": "lin_ap0",
+    "omni_video_transform": VpeOmniVideoTransform(
+        initialization_video=MP4,
+        noise_strength=0.8,
+        mask=MP4,
+    ),
+    "audio_control": VpeAudioControl(target_audio=WAV),
 }
 
 ALL_CAPABILITIES = pytest.mark.parametrize(
@@ -1010,15 +1068,95 @@ def leaves(node: Any) -> list[Any]:
     return [node]
 
 
-def maximal_request(capability: VpeCapability) -> VpeRequest:
-    """Builds a request exercising every field a capability declares.
+def maximal_requests(capability: VpeCapability) -> list[VpeRequest]:
+    """Builds valid request variants exercising every field of a capability.
 
-    Args:
-        capability: The registry entry to saturate.
-
-    Returns:
-        A request carrying every accepted instance field and parameter.
+    Capabilities with mutually-exclusive parameter branches (e.g. container
+    ``codec`` vs EXR sequence ``fps`` + ``exrColorSpaceOverride`` on
+    ``SUPER_RES``, or ``targetAudio`` vs ``useTargetAudioFromVideo`` /
+    ``referenceAudios``) return multiple valid requests whose union covers
+    every declared instance field and parameter.
     """
+    if capability.capability_id is VpeCapabilityId.SUPER_RES:
+        return [
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=MP4,
+                super_res_mode="MODE_4K_PRO",
+                super_res_steps=2,
+                compression_quality="lossless",
+                codec="prores",
+                sharpness=3,
+                seed=42,
+            ),
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=EXR_SEQ,
+                super_res_mode="MODE_4K",
+                fps=30,
+                exr_color_space_override="lin_ap0",
+                compression_quality="optimized",
+            ),
+        ]
+    if capability.capability_id is VpeCapabilityId.OMNI_PERF:
+        return [
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_PERF,
+                storage_uri=OUTPUT_DIR,
+                prompt="A prompt",
+                video=MP4,
+                reference_images=(PNG, WEBP),
+                compression_quality="lossless",
+                codec="prores",
+                audio_control=VpeAudioControl(target_audio=WAV),
+            ),
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_PERF,
+                storage_uri=OUTPUT_DIR,
+                prompt="A prompt",
+                video=MP4,
+                reference_images=(PNG,),
+                audio_control=VpeAudioControl(use_target_audio_from_video=True),
+            ),
+        ]
+    if capability.capability_id is VpeCapabilityId.OMNI_CINE:
+        return [
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_CINE,
+                storage_uri=OUTPUT_DIR,
+                prompt="A prompt",
+                video=EXR_SEQ,
+                image=PNG,
+                last_frame=PNG,
+                reference_images=(PNG, WEBP),
+                reference_audios=(WAV,),
+                compression_quality="lossless",
+                codec="prores",
+                exr_color_space_override="lin_ap1",
+                omni_video_transform=VpeOmniVideoTransform(
+                    initialization_video=MP4,
+                    noise_strength=0.8,
+                    mask=MP4,
+                ),
+            ),
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_CINE,
+                storage_uri=OUTPUT_DIR,
+                prompt="A prompt",
+                video=MP4,
+                audio_control=VpeAudioControl(target_audio=WAV),
+            ),
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_CINE,
+                storage_uri=OUTPUT_DIR,
+                prompt="A prompt",
+                video=MP4,
+                audio_control=VpeAudioControl(use_target_audio_from_video=True),
+            ),
+        ]
+
     fields: dict[str, Any] = {
         "capability_id": capability.capability_id,
         "storage_uri": OUTPUT_DIR,
@@ -1045,7 +1183,12 @@ def maximal_request(capability: VpeCapability) -> VpeRequest:
         attribute = PARAMETER_ATTRIBUTES[(spec.name, spec.location)]
         if attribute is not None:
             fields[attribute] = MAXIMAL_VALUES[attribute]
-    return VpeRequest(**fields)
+    return [VpeRequest(**fields)]
+
+
+def maximal_request(capability: VpeCapability) -> VpeRequest:
+    """Returns the primary maximal request for a capability."""
+    return maximal_requests(capability)[0]
 
 
 # --- Dispatch and cross-capability invariants ----------------------------
@@ -1066,8 +1209,9 @@ def test_every_capability_has_a_builder(capability: VpeCapability):
 @ALL_CAPABILITIES
 def test_payload_is_json_serializable(capability: VpeCapability):
     """The client posts this straight to REST, so it must be plain JSON."""
-    payload = build_payload(maximal_request(capability))
-    assert json.loads(json.dumps(payload)) == payload
+    for req in maximal_requests(capability):
+        payload = build_payload(req)
+        assert json.loads(json.dumps(payload)) == payload
 
 
 @ALL_CAPABILITIES
@@ -1080,32 +1224,38 @@ def test_payload_never_carries_nulls(capability: VpeCapability):
 @ALL_CAPABILITIES
 def test_enum_inputs_are_written_as_plain_strings(capability: VpeCapability):
     """Registry enums may be passed in, but must not reach the wire."""
-    payload = build_payload(maximal_request(capability))
-    assert all(
-        type(leaf) in (str, int, float, bool) for leaf in leaves(payload)
-    )
+    for req in maximal_requests(capability):
+        payload = build_payload(req)
+        assert all(
+            type(leaf) in (str, int, float, bool) for leaf in leaves(payload)
+        )
 
 
 @ALL_CAPABILITIES
 def test_every_declared_parameter_is_reachable(capability: VpeCapability):
-    """No registry parameter may be unreachable from a request field.
-
-    A parameter that exists in the registry but that no request field feeds
-    is a capability the app silently cannot use.
-    """
-    payload = build_payload(maximal_request(capability))
+    """No registry parameter may be unreachable from a request field."""
+    payloads = [build_payload(req) for req in maximal_requests(capability)]
     for spec in capability.parameters:
-        assert lookup(payload, spec.json_path) is not None, spec.json_path
+        found = False
+        for payload in payloads:
+            try:
+                if lookup(payload, spec.json_path) is not None:
+                    found = True
+                    break
+            except KeyError:
+                continue
+        assert found, spec.json_path
 
 
 @ALL_CAPABILITIES
 def test_every_declared_instance_field_is_reachable(
     capability: VpeCapability,
 ):
-    payload = build_payload(maximal_request(capability))
-    instance = payload["instances"][0]
+    payloads = [build_payload(req) for req in maximal_requests(capability)]
     for spec in capability.instance_fields:
-        assert spec.field.value in instance
+        assert any(
+            spec.field.value in payload["instances"][0] for payload in payloads
+        )
 
 
 def test_zero_valued_parameters_are_sent_not_swallowed():
@@ -1944,3 +2094,169 @@ def test_registry_lookup_agrees_with_the_builders():
             )
             == get_capability(capability.capability_id).model_name
         )
+
+
+# --- GMP Nov 2026 contract & refusal tests --------------------------------
+
+
+def test_super_res_payload_shape_and_refusals():
+    payload = build_payload(
+        VpeRequest(
+            capability_id=VpeCapabilityId.SUPER_RES,
+            storage_uri=OUTPUT_DIR,
+            video=MP4,
+            super_res_mode="MODE_8K",
+            super_res_steps=2,
+            sharpness=4,
+            seed=7,
+            codec="prores",
+            compression_quality="lossless",
+        )
+    )
+    assert payload == {
+        "instances": [
+            {"video": {"gcsUri": MP4.gcs_uri, "mimeType": "video/mp4"}}
+        ],
+        "parameters": {
+            "storageUri": OUTPUT_DIR,
+            "compressionQuality": "lossless",
+            "sharpness": 4,
+            "seed": 7,
+            "experiments": {
+                "modelName": "veo-exp-super-res",
+                "codec": "prores",
+                "customParameters": {
+                    "superResConfig": {"mode": "MODE_8K", "steps": 2}
+                },
+            },
+        },
+    }
+
+    # Missing mode is refused
+    with pytest.raises(VpePayloadError, match="mode"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=MP4,
+            )
+        )
+
+    # fps on MP4 container is refused
+    with pytest.raises(VpePayloadError, match="image sequences"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=MP4,
+                super_res_mode="MODE_4K",
+                fps=30,
+            )
+        )
+
+    # codec with EXR or lossless_16bit_png is refused
+    with pytest.raises(VpePayloadError, match="codec must be omitted"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=EXR_SEQ,
+                super_res_mode="MODE_4K",
+                codec="prores",
+            )
+        )
+
+    # exrColorSpaceOverride on non-EXR is refused
+    with pytest.raises(VpePayloadError, match="EXR"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=MP4,
+                super_res_mode="MODE_4K",
+                exr_color_space_override="lin_ap0",
+            )
+        )
+
+    # MODE_8K disallows lossless_16bit_png and lossless DNxHR
+    with pytest.raises(VpePayloadError, match="MODE_8K"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=MP4,
+                super_res_mode="MODE_8K",
+                compression_quality="lossless_16bit_png",
+            )
+        )
+    with pytest.raises(VpePayloadError, match="MODE_8K"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.SUPER_RES,
+                storage_uri=OUTPUT_DIR,
+                video=MP4,
+                super_res_mode="MODE_8K",
+                codec="dnxhr",
+                compression_quality="lossless",
+            )
+        )
+
+
+def test_omni_perf_payload_and_audio_control_mutual_exclusion():
+    payload = build_payload(
+        VpeRequest(
+            capability_id=VpeCapabilityId.OMNI_PERF,
+            storage_uri=OUTPUT_DIR,
+            prompt="Character acting",
+            video=MP4,
+            reference_images=(PNG, WEBP),
+            codec="prores",
+            compression_quality="lossless",
+            audio_control=VpeAudioControl(use_target_audio_from_video=True),
+        )
+    )
+    assert (
+        payload["instances"][0]["referenceImages"][0]["referenceType"]
+        == "ASSET"
+    )
+    assert (
+        lookup(
+            payload,
+            "parameters.experiments.customParameters.audioControl.useTargetAudioFromVideo",
+        )
+        is True
+    )
+
+    with pytest.raises(VpePayloadError, match="mutually exclusive"):
+        VpeAudioControl(target_audio=WAV, use_target_audio_from_video=True)
+    with pytest.raises(VpePayloadError, match="requires either"):
+        VpeAudioControl()
+
+
+def test_omni_cine_last_frame_and_audio_exclusivity_rules():
+    # lastFrame without image is refused
+    with pytest.raises(VpePayloadError, match="lastFrame requires"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_CINE,
+                storage_uri=OUTPUT_DIR,
+                prompt="Interpolate",
+                last_frame=PNG,
+            )
+        )
+
+    # referenceAudios and audioControl are mutually exclusive
+    with pytest.raises(VpePayloadError, match="mutually exclusive"):
+        build_payload(
+            VpeRequest(
+                capability_id=VpeCapabilityId.OMNI_CINE,
+                storage_uri=OUTPUT_DIR,
+                prompt="Conflict",
+                reference_audios=(WAV,),
+                audio_control=VpeAudioControl(target_audio=WAV),
+            )
+        )
+
+    # noiseStrength out of range is refused
+    with pytest.raises(VpePayloadError, match="noiseStrength"):
+        VpeOmniVideoTransform(initialization_video=MP4, noise_strength=1.5)

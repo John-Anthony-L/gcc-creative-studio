@@ -162,3 +162,57 @@ class TestCapabilitiesWithoutVideoInput:
         )
         assert result.screening is VpeScreening.RULED_OUT
         assert result.findings[0].code is VpeReasonCode.MEDIA_KIND_UNSUPPORTED
+        assert result.supported_modes == ()
+
+
+class TestScreenUpscaleCandidate:
+    """GMP upscale screening across Super-Res, Seamless, and Segmented modes."""
+
+    def test_4k_source_is_offered_8k_only(self):
+        from src.videos.vpe.gating import screen_upscale_candidate
+
+        res = screen_upscale_candidate(duration_seconds=8.0, resolution="4K")
+        assert res.offer is True
+        assert res.capability_id == str(VpeCapabilityId.UPSCALE)
+        assert res.supported_modes == ("8k",)
+
+        too_long_4k = screen_upscale_candidate(
+            duration_seconds=15.0, resolution="4K"
+        )
+        assert too_long_4k.offer is False
+        assert too_long_4k.supported_modes == ()
+
+    def test_seamless_video_texture_is_offered_4k_only(self):
+        from src.videos.vpe.gating import (
+            is_seamless_raw_data,
+            screen_upscale_candidate,
+        )
+
+        raw = {"seamless": {"loop": True, "tessellate_horizontal": False}}
+        assert is_seamless_raw_data(raw) is True
+        assert is_seamless_raw_data({"seamless": {"loop": False}}) is False
+
+        res = screen_upscale_candidate(
+            duration_seconds=8.0,
+            resolution="1K",
+            raw_data=raw,
+        )
+        assert res.offer is True
+        assert res.capability_id == str(VpeCapabilityId.UPSCALE)
+        assert res.supported_modes == ("4k",)
+
+    def test_standard_720p_and_1080p_offer_all_four_modes(self):
+        from src.videos.vpe.gating import screen_upscale_candidate
+
+        for res_name, dur in [("1K", 8.0), ("2K", 10.0)]:
+            res = screen_upscale_candidate(
+                duration_seconds=dur,
+                resolution=res_name,
+                max_segments=6,
+            )
+            assert res.offer is True
+            assert res.supported_modes == ("1080p", "4k", "4k_pro", "8k")
+
+        short = screen_upscale_candidate(duration_seconds=2.5, resolution="1K")
+        assert short.offer is True
+        assert short.supported_modes == ("4k", "4k_pro", "8k")

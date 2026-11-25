@@ -1906,10 +1906,15 @@ class VeoService:
             The initial MediaItem with a 'processing' status and a pre-generated ID.
 
         """
-        if request_dto.generation_model in (
+        vpe_models = (
             GenerationModelEnum.VEO_EXP_A2V_GENERATION,
             GenerationModelEnum.VEO_EXP_VIDEO_TRANSFORM,
-        ):
+            GenerationModelEnum.VEO_EXP_PERF_ESTIMATION,
+            GenerationModelEnum.OMNI_PERF,
+            GenerationModelEnum.OMNI_CINE,
+            GenerationModelEnum.VEO_EXP_VIDEO_TEXTURES,
+        )
+        if request_dto.generation_model in vpe_models:
             from src.videos.vpe_service import (  # pylint: disable=import-outside-toplevel
                 VpeJobError,
                 require_vpe_configured,
@@ -2082,30 +2087,38 @@ class VeoService:
         placeholder_item = await self.media_repo.create(placeholder_item)
 
         # 3. Submit background task
-        if (
-            request_dto.generation_model
-            == GenerationModelEnum.VEO_EXP_A2V_GENERATION
-        ):
+        if request_dto.generation_model in vpe_models:
             from src.videos.vpe_service import (  # pylint: disable=import-outside-toplevel
                 _process_vpe_dialogue_in_background,
+                _process_vpe_omni_cine_in_background,
+                _process_vpe_omni_perf_in_background,
+                _process_vpe_perf_estimation_in_background,
+                _process_vpe_transform_in_background,
+                _process_vpe_video_textures_in_background,
             )
 
+            vpe_dispatch = {
+                GenerationModelEnum.VEO_EXP_A2V_GENERATION: (
+                    _process_vpe_dialogue_in_background
+                ),
+                GenerationModelEnum.VEO_EXP_VIDEO_TRANSFORM: (
+                    _process_vpe_transform_in_background
+                ),
+                GenerationModelEnum.VEO_EXP_PERF_ESTIMATION: (
+                    _process_vpe_perf_estimation_in_background
+                ),
+                GenerationModelEnum.OMNI_PERF: (
+                    _process_vpe_omni_perf_in_background
+                ),
+                GenerationModelEnum.OMNI_CINE: (
+                    _process_vpe_omni_cine_in_background
+                ),
+                GenerationModelEnum.VEO_EXP_VIDEO_TEXTURES: (
+                    _process_vpe_video_textures_in_background
+                ),
+            }
             executor.submit(
-                _process_vpe_dialogue_in_background,
-                media_item_id=placeholder_item.id,
-                request_dto=request_dto,
-                user_email=user.email,
-            )
-        elif (
-            request_dto.generation_model
-            == GenerationModelEnum.VEO_EXP_VIDEO_TRANSFORM
-        ):
-            from src.videos.vpe_service import (  # pylint: disable=import-outside-toplevel
-                _process_vpe_transform_in_background,
-            )
-
-            executor.submit(
-                _process_vpe_transform_in_background,
+                vpe_dispatch[request_dto.generation_model],
                 media_item_id=placeholder_item.id,
                 request_dto=request_dto,
                 user_email=user.email,

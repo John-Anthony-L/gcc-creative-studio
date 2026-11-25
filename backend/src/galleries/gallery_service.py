@@ -252,6 +252,25 @@ class GalleryService:
             if uri
         ]
 
+        # 1.6 Create tasks for ProRes / DNxHR master media URLs in raw_data
+        raw_data = (
+            item.raw_data
+            if isinstance(getattr(item, "raw_data", None), dict)
+            else {}
+        )
+        raw_master_uris = raw_data.get("master_gcs_uris") or []
+        all_master_gcs_uris = (
+            [u for u in raw_master_uris if isinstance(u, str) and u]
+            if isinstance(raw_master_uris, list)
+            else []
+        )
+        master_url_tasks = [
+            asyncio.to_thread(
+                self.iam_signer_credentials.generate_presigned_url, uri
+            )
+            for uri in all_master_gcs_uris
+        ]
+
         # 2. Create tasks for thumbnail URLs
         thumbnail_tasks = [
             asyncio.to_thread(
@@ -281,12 +300,14 @@ class GalleryService:
         (
             presigned_urls,
             original_presigned_urls,
+            master_presigned_urls,
             presigned_thumbnail_urls,
             enriched_source_assets_with_nones,
             enriched_source_media_items_with_nones,
         ) = await asyncio.gather(
             asyncio.gather(*main_url_tasks),
             asyncio.gather(*original_url_tasks),
+            asyncio.gather(*master_url_tasks),
             asyncio.gather(*thumbnail_tasks),
             asyncio.gather(*source_asset_tasks),
             asyncio.gather(*source_media_item_tasks),
@@ -304,6 +325,9 @@ class GalleryService:
             **item.model_dump(exclude={"source_assets"}),
             presigned_urls=presigned_urls,
             original_presigned_urls=original_presigned_urls,
+            master_presigned_urls=(
+                list(master_presigned_urls) if all_master_gcs_uris else None
+            ),
             presigned_thumbnail_urls=presigned_thumbnail_urls,
             enriched_source_assets=enriched_source_assets or None,
             enriched_source_media_items=enriched_source_media_items or None,
@@ -316,6 +340,23 @@ class GalleryService:
         """Enriches a UnifiedGalleryItemResponse with presigned URLs."""
         uris_to_sign = [u for u in (item.gcs_uris or []) if u]
         thumbnail_uris_to_sign = [u for u in (item.thumbnail_uris or []) if u]
+        master_uris_to_sign: list[str] = []
+        if isinstance(item.metadata, dict):
+            raw_master = item.metadata.get(
+                "masterGcsUris"
+            ) or item.metadata.get("master_gcs_uris")
+            if not raw_master:
+                nested_raw = item.metadata.get("rawData") or item.metadata.get(
+                    "raw_data"
+                )
+                if isinstance(nested_raw, dict):
+                    raw_master = nested_raw.get(
+                        "master_gcs_uris"
+                    ) or nested_raw.get("masterGcsUris")
+            if isinstance(raw_master, list):
+                master_uris_to_sign = [
+                    u for u in raw_master if isinstance(u, str) and u
+                ]
 
         url_tasks = [
             asyncio.to_thread(
@@ -331,9 +372,21 @@ class GalleryService:
             for uri in thumbnail_uris_to_sign
         ]
 
-        presigned_urls, presigned_thumbnail_urls = await asyncio.gather(
+        master_tasks = [
+            asyncio.to_thread(
+                self.iam_signer_credentials.generate_presigned_url, uri
+            )
+            for uri in master_uris_to_sign
+        ]
+
+        (
+            presigned_urls,
+            presigned_thumbnail_urls,
+            master_presigned_urls,
+        ) = await asyncio.gather(
             asyncio.gather(*url_tasks),
             asyncio.gather(*thumbnail_tasks),
+            asyncio.gather(*master_tasks),
         )
 
         external_url = None
@@ -357,6 +410,9 @@ class GalleryService:
 
         item.presigned_urls = presigned_urls
         item.presigned_thumbnail_urls = presigned_thumbnail_urls
+        item.master_presigned_urls = (
+            list(master_presigned_urls) if master_uris_to_sign else None
+        )
         return item
 
     async def get_paginated_gallery(

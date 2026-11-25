@@ -20,6 +20,15 @@ export enum VpeUpscaleResolution {
   UHD_4K = '4k',
 }
 
+export type VpeUpscaleMode = '1080p' | '4k' | '4k_pro' | '8k';
+export type VpeOutputCodec = 'h264' | 'prores' | 'dnxhr';
+export type VpeCompressionQuality = 'optimized' | 'lossless';
+
+export interface VpeConfigResponse {
+  enabled: boolean;
+  capabilities: string[];
+}
+
 export interface VpeFindingResponse {
   code: string;
   severity: string;
@@ -34,13 +43,14 @@ export interface VpeFindingResponse {
  *
  * `VpeScreeningResponse` on the backend is a plain Pydantic model with no
  * camelCase alias generator (unlike most DTOs in this app), so
- * `capability_id` is the one field that stays snake_case on the wire.
+ * `capability_id` and `supported_modes` stay snake_case on the wire.
  */
 export interface VpeScreeningResponse {
   capability_id: string;
   screening: 'ruled_out' | 'not_ruled_out' | 'unknown';
   offer: boolean;
   findings: VpeFindingResponse[];
+  supported_modes?: string[];
 }
 
 export interface UpscaleVideoDto {
@@ -48,5 +58,10 @@ export interface UpscaleVideoDto {
   mediaItemId: number;
   mediaIndex: number;
   resolution: VpeUpscaleResolution;
+  upscaleMode?: VpeUpscaleMode;
+  steps?: 1 | 2;
   sharpness?: number;
+  seed?: number;
+  outputCodec?: VpeOutputCodec;
+  compressionQuality?: VpeCompressionQuality;
 }

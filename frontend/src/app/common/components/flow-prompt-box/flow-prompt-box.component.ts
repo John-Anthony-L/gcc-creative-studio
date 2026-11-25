@@ -186,10 +186,59 @@ export class FlowPromptBoxComponent implements OnInit, OnDestroy {
     index: number;
     frameNumber: number;
   }>();
+  @Output() outputCodecChanged = new EventEmitter<
+    'h264' | 'prores' | 'dnxhr'
+  >();
+  @Output() compressionQualityChanged = new EventEmitter<
+    'optimized' | 'lossless'
+  >();
+  @Output() audioControlModeChanged = new EventEmitter<
+    | 'generate'
+    | 'preserve_video_audio'
+    | 'target_audio'
+    | 'reference_audio'
+    | null
+  >();
+  @Output() isBlueMeshInputChanged = new EventEmitter<boolean>();
+  @Output() seamlessLoopChanged = new EventEmitter<boolean>();
+  @Output() tessellateHorizontalChanged = new EventEmitter<boolean>();
+  @Output() tessellateVerticalChanged = new EventEmitter<boolean>();
 
   readonly validFrameNumbers: number[] = [
     8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144,
     152, 160, 168, 176, 184,
+  ];
+
+  readonly deliveryFormatOptions: {
+    key: string;
+    label: string;
+    codec: 'h264' | 'prores' | 'dnxhr';
+    quality: 'optimized' | 'lossless';
+  }[] = [
+    {
+      key: 'h264_optimized',
+      label: 'Web MP4 (H.264)',
+      codec: 'h264',
+      quality: 'optimized',
+    },
+    {
+      key: 'prores_optimized',
+      label: 'Apple ProRes 422 (.mov)',
+      codec: 'prores',
+      quality: 'optimized',
+    },
+    {
+      key: 'prores_lossless',
+      label: 'Apple ProRes 4444 Lossless (.mov)',
+      codec: 'prores',
+      quality: 'lossless',
+    },
+    {
+      key: 'dnxhr_optimized',
+      label: 'Avid DNxHR HQ (.mxf)',
+      codec: 'dnxhr',
+      quality: 'optimized',
+    },
   ];
 
   @Input() image1Preview: string | null = null;
@@ -247,6 +296,18 @@ export class FlowPromptBoxComponent implements OnInit, OnDestroy {
   @Input() transformStrength = 0.5;
   @Input() seed: number | null = null;
   @Input() numDiffusionSteps = 20;
+  @Input() outputCodec: 'h264' | 'prores' | 'dnxhr' = 'h264';
+  @Input() compressionQuality: 'optimized' | 'lossless' = 'optimized';
+  @Input() audioControlMode:
+    | 'generate'
+    | 'preserve_video_audio'
+    | 'target_audio'
+    | 'reference_audio'
+    | null = null;
+  @Input() isBlueMeshInput = false;
+  @Input() seamlessLoop = true;
+  @Input() tessellateHorizontal = false;
+  @Input() tessellateVertical = false;
 
   @ViewChild('promptInput') promptInput?: ElementRef<HTMLTextAreaElement>;
   @ViewChild('modeTrigger') modeTrigger!: ElementRef;
@@ -349,7 +410,14 @@ export class FlowPromptBoxComponent implements OnInit, OnDestroy {
   isModeMenuOpen = signal<boolean>(false);
   isSettingsMenuOpen = signal<boolean>(false);
   isSettingsDropdownOpen = signal<
-    'aspect' | 'outputs' | 'model' | 'resolution' | 'duration' | null
+    | 'aspect'
+    | 'outputs'
+    | 'model'
+    | 'resolution'
+    | 'duration'
+    | 'deliveryFormat'
+    | 'audioControl'
+    | null
   >(null);
   selectedMode = signal<string>('Text to Video');
   selectedPreset = signal<string>('');
@@ -453,6 +521,150 @@ export class FlowPromptBoxComponent implements OnInit, OnDestroy {
 
   get supportsSeed(): boolean {
     return !!this.getSelectedModelObject()?.capabilities?.supportsSeed;
+  }
+
+  get supportsSeamlessLoop(): boolean {
+    return !!this.getSelectedModelObject()?.capabilities?.supportsSeamlessLoop;
+  }
+
+  get supportsPerformanceControl(): boolean {
+    return !!this.getSelectedModelObject()?.capabilities
+      ?.supportsPerformanceControl;
+  }
+
+  get supportsAudioControlMode(): boolean {
+    return !!this.getSelectedModelObject()?.capabilities
+      ?.supportsAudioControlMode;
+  }
+
+  get supportsProFormats(): boolean {
+    return !!this.getSelectedModelObject()?.capabilities?.supportsProFormats;
+  }
+
+  get proFormatBadgeLabel(): string | null {
+    if (!this.supportsProFormats || this.outputCodec === 'h264') {
+      return null;
+    }
+    if (this.outputCodec === 'prores') {
+      return this.compressionQuality === 'lossless' ? 'ProRes 4444' : 'ProRes';
+    }
+    if (this.outputCodec === 'dnxhr') {
+      return 'DNxHR';
+    }
+    return null;
+  }
+
+  get selectedDeliveryFormatLabel(): string {
+    const matched = this.deliveryFormatOptions.find(
+      opt =>
+        opt.codec === this.outputCodec &&
+        opt.quality === this.compressionQuality,
+    );
+    if (matched) {
+      return matched.label;
+    }
+    if (this.outputCodec === 'prores') {
+      return 'Apple ProRes 422 (.mov)';
+    }
+    if (this.outputCodec === 'dnxhr') {
+      return 'Avid DNxHR HQ (.mxf)';
+    }
+    return 'Web MP4 (H.264)';
+  }
+
+  get availableAudioControlOptions(): {
+    value:
+      | 'generate'
+      | 'preserve_video_audio'
+      | 'target_audio'
+      | 'reference_audio';
+    label: string;
+  }[] {
+    const options: {
+      value:
+        | 'generate'
+        | 'preserve_video_audio'
+        | 'target_audio'
+        | 'reference_audio';
+      label: string;
+    }[] = [
+      {value: 'generate', label: 'Generate Audio'},
+      {value: 'preserve_video_audio', label: 'Preserve Video Audio'},
+      {value: 'target_audio', label: 'Sync Target Audio (Lip-Sync / Dub)'},
+    ];
+    if (this.getSelectedModelObject()?.value === 'omni-cine') {
+      options.push({value: 'reference_audio', label: 'Voice/Sound Reference'});
+    }
+    return options;
+  }
+
+  get selectedAudioControlLabel(): string {
+    const current = this.audioControlMode ?? 'generate';
+    return (
+      this.availableAudioControlOptions.find(opt => opt.value === current)
+        ?.label ?? 'Generate Audio'
+    );
+  }
+
+  get showAudioReferenceSlot(): boolean {
+    if (!this.getSelectedModelObject()?.capabilities?.supportsAudioReference) {
+      return false;
+    }
+    if (this.mode === 'Ingredients to Video') {
+      return true;
+    }
+    return (
+      this.supportsAudioControlMode &&
+      (this.audioControlMode === 'target_audio' ||
+        this.audioControlMode === 'reference_audio')
+    );
+  }
+
+  selectDeliveryFormat(option: {
+    codec: 'h264' | 'prores' | 'dnxhr';
+    quality: 'optimized' | 'lossless';
+  }): void {
+    this.outputCodec = option.codec;
+    this.compressionQuality = option.quality;
+    this.outputCodecChanged.emit(option.codec);
+    this.compressionQualityChanged.emit(option.quality);
+    this.isSettingsDropdownOpen.set(null);
+  }
+
+  selectAudioControlMode(
+    value:
+      | 'generate'
+      | 'preserve_video_audio'
+      | 'target_audio'
+      | 'reference_audio',
+  ): void {
+    this.audioControlMode = value;
+    this.audioControlModeChanged.emit(value);
+    this.isSettingsDropdownOpen.set(null);
+  }
+
+  onBlueMeshInputToggle(event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.isBlueMeshInput = checked;
+    this.isBlueMeshInputChanged.emit(checked);
+  }
+
+  onSeamlessLoopToggle(event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.seamlessLoop = checked;
+    this.seamlessLoopChanged.emit(checked);
+  }
+
+  onTessellateHorizontalToggle(event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.tessellateHorizontal = checked;
+    this.tessellateHorizontalChanged.emit(checked);
+  }
+
+  onTessellateVerticalToggle(event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.tessellateVertical = checked;
+    this.tessellateVerticalChanged.emit(checked);
   }
 
   onTransformStrengthInput(event: Event) {

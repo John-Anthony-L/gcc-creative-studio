@@ -48,6 +48,7 @@ class MediaItemResponse(MediaItemModel):
 
     presigned_urls: list[str] = []
     original_presigned_urls: list[str] | None = None
+    master_presigned_urls: list[str] | None = None
     presigned_thumbnail_urls: list[str] | None = []
     enriched_source_assets: list[SourceAssetLinkResponse] | None = None
     enriched_source_media_items: list[SourceMediaItemLinkResponse] | None = None

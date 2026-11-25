@@ -13,7 +13,9 @@
 # limitations under the License.
 """Request shape for a VPE upscale."""
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from src.common.base_dto import BaseDto
 from src.videos.vpe.capabilities import (
@@ -28,13 +30,7 @@ _SHARPNESS = get_capability(VpeCapabilityId.UPSCALE).parameter("sharpness")
 
 
 class UpscaleVideoDto(BaseDto):
-    """Data Transfer Object for upscaling an existing gallery video.
-
-    Deliberately thin. The upscaler takes a clip and gives back the same clip
-    with more pixels, so there is no prompt, no seed and no aspect ratio to
-    choose: the ratio is whatever the source measures, and sending anything
-    else is rejected by the API.
-    """
+    """Data Transfer Object for upscaling an existing gallery video."""
 
     workspace_id: int = Field(
         ge=1,
@@ -55,8 +51,15 @@ class UpscaleVideoDto(BaseDto):
     resolution: VpeUpscaleResolution = Field(
         default=VpeUpscaleResolution.UHD_4K,
         description=(
-            "Target resolution. The API's own default is 720p, which upscales"
-            " nothing, so this defaults to 4K instead."
+            "Target resolution (legacy 1080p / 4k). Kept for backward"
+            " compatibility when upscaleMode is omitted."
+        ),
+    )
+    upscale_mode: Literal["1080p", "4k", "4k_pro", "8k"] | None = Field(
+        default=None,
+        description=(
+            "GMP upscale tier ('1080p', '4k', '4k_pro', '8k'). Overrides"
+            " resolution when provided."
         ),
     )
     sharpness: int | None = Field(
@@ -68,3 +71,52 @@ class UpscaleVideoDto(BaseDto):
             " the parameter is not sent and the model uses its own default."
         ),
     )
+    steps: Literal[1, 2] | None = Field(
+        default=None,
+        description="Optional diffusion steps for GMP Super Resolution (1 or 2).",
+    )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=4294967295,
+        description="Optional deterministic seed (0 to 4294967295).",
+    )
+    output_codec: Literal["h264", "prores", "dnxhr"] = Field(
+        default="h264",
+        description="Output container/codec: h264, prores (.mov), or dnxhr (.mxf).",
+    )
+    compression_quality: Literal["optimized", "lossless"] = Field(
+        default="optimized",
+        description="Compression quality profile: optimized or lossless.",
+    )
+
+    @property
+    def resolved_mode(self) -> Literal["1080p", "4k", "4k_pro", "8k"]:
+        """Returns the effective upscale mode, falling back to resolution."""
+        if self.upscale_mode is not None:
+            return self.upscale_mode
+        if self.resolution == VpeUpscaleResolution.HD_1080P:
+            return "1080p"
+        return "4k"
+
+    @model_validator(mode="after")
+    def validate_codec_and_mode(self) -> "UpscaleVideoDto":
+        """Enforces GMP Super Resolution codec and compression rules."""
+        if (
+            self.compression_quality == "lossless"
+            and self.output_codec == "h264"
+        ):
+            raise ValueError(
+                "Lossless compressionQuality requires output_codec 'prores' or"
+                " 'dnxhr'."
+            )
+        if (
+            self.resolved_mode == "8k"
+            and self.output_codec == "dnxhr"
+            and self.compression_quality == "lossless"
+        ):
+            raise ValueError(
+                "8K lossless DNxHR is not supported; use 'prores' or"
+                " 'optimized'."
+            )
+        return self

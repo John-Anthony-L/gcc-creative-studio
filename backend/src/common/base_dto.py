@@ -62,6 +62,11 @@ class GenerationModelEnum(str, Enum):
     GEMINI_OMNI_FLASH_PREVIEW = "gemini-omni-flash-preview"
     VEO_EXP_A2V_GENERATION = "veo-exp-a2v-generation"
     VEO_EXP_VIDEO_TRANSFORM = "veo-exp-video-transform"
+    VEO_EXP_SUPER_RES = "veo-exp-super-res"
+    VEO_EXP_PERF_ESTIMATION = "veo-exp-perf-estimation"
+    OMNI_PERF = "omni-perf"
+    OMNI_CINE = "omni-cine"
+    VEO_EXP_VIDEO_TEXTURES = "veo-exp-video-textures"
     # A VPE checkpoint, not a publisher model. Every VPE capability is reached
     # through the one "veo-experimental" endpoint and chosen by this name
     # inside the payload, so the checkpoint is what identifies the model that
@@ -87,6 +92,7 @@ class GenerationModelEnum(str, Enum):
     GEMINI_3_1_FLASH_TTS_PREVIEW = "gemini-3.1-flash-tts-preview"
 
     # Deprecated models (For old generations only, do not use)
+    _DEPRECATED_VEO_EXP_PERF_GENERATION = "veo-exp-perf-generation"
     IMAGEN_4_UPSCALE_PREVIEW = "imagen-4.0-upscale-preview"
     _DEPRECATED_VTO = "virtual-try-on-preview-08-04"
     # Never resolved on Vertex: the Interactions API answers

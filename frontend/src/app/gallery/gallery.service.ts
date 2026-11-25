@@ -31,7 +31,6 @@ import {
   map,
 } from 'rxjs/operators';
 import {environment} from '../../environments/environment';
-import {MediaItem} from '../common/models/media-item.model';
 import {
   GalleryItem,
   PaginatedGalleryResponse,
@@ -335,7 +334,8 @@ export class GalleryService implements OnDestroy {
       modifiers: item.modifiers || metadata.modifiers,
       comment: item.comment || metadata.comment,
       critique: item.critique || metadata.critique,
-      rawData: item.rawData || metadata.raw_data,
+      rawData:
+        item.rawData || item.raw_data || metadata.rawData || metadata.raw_data,
       audioAnalysis: item.audioAnalysis || metadata.audio_analysis,
       errorMessage:
         item.errorMessage ||
@@ -346,6 +346,9 @@ export class GalleryService implements OnDestroy {
       originalGcsUris: item.originalGcsUris || item.original_gcs_uris || [],
       originalPresignedUrls:
         item.originalPresignedUrls || item.original_presigned_urls || [],
+      masterGcsUris: item.masterGcsUris || item.master_gcs_uris || [],
+      masterPresignedUrls:
+        item.masterPresignedUrls || item.master_presigned_urls || [],
       deletedAt: item.deletedAt || item.deleted_at || metadata.deleted_at, // Added mapping for soft delete
     };
     return galleryItem;

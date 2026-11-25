@@ -39,25 +39,22 @@ Learn more about the multi-agent multimedia ecosystem at the [Izumi Agent Reposi
 
 Creative Studio goes beyond simple demos, implementing advanced, real-world features that developers can learn from and build upon:
 
-**🎬 Advanced Video Generation (Gemini Omni, Veo 3.1 & Veo Pro Experimental):**
+**🎬 Advanced Video Generation (Veo):**
 
-- Generate high-fidelity videos with **Gemini Omni 1.2 Flash** (up to 15s clips, 10 reference images, 3 reference videos, `<FIRST_FRAME>` / `<IMAGE_REF_N>` role tags, `Edit Video`, and `Extend Video`), **Veo 3.1** (`Quality`, `Fast`, `Lite`, and `Lite Preview`), and **Veo Pro Experimental** (`4K Video Upscale`, `Dialogue Lip Sync`, and `Video Transform / Restyle` with masks and conditioning keyframes).
-- Utilize Ingredients-to-Video (R2V), Frames-to-Video, and Multi-Project workspace routing for isolated billing and GCS storage.
+- Generate high-quality videos from text prompts.
+- Utilize Image-to-Video (R2V) capabilities, allowing users to upload reference images.
+- Differentiate between reference types, using images for ASSET consistency or STYLE transfer.
 
-**🖼️ High-Fidelity Image Generation & Upscaling (Nano Banana & Imagen 4):**
+**🖼️ High-Fidelity Image Generation (Imagen):**
 
-- Generate and edit images with **Nano Banana 2** (`gemini-3.1-flash-image`), **Nano Banana 2 Lite** (`gemini-3.1-flash-lite-image`), **Nano Banana Pro** (`gemini-3-pro-image`), **Nano Banana** (`gemini-2.5-flash-image`), and **Imagen 4**.
-- Supports **Video-to-Image** (extracting and reimagining scenes from uploaded/generated videos or **YouTube URLs**), **Auto (Dynamic)** aspect ratio, Google Search grounding, sampling temperature control, and **Nano Banana 2 2K/4K Image Upscaling**.
+- Create stunning images from detailed text descriptions.
+- Explore a wide range of creative styles, lighting, and composition controls.
 
-**🎵 Music & Speech Generation (Lyria 3, Chirp 3 & Gemini TTS):**
-
-- Generate instrumental and vocal music tracks with **Lyria 3 Clip Preview** (`lyria-3-clip-preview`), full-length **Lyria 3 Pro Preview** (`lyria-3-pro-preview`), and **Lyria 2** (`lyria-002`).
-- Synthesize natural multilingual speech with **Gemini 3.1 Flash TTS** (`gemini-3.1-flash-tts-preview`), **Chirp 3**, and custom voice cloning.
-
-**✍️ Multimodal Prompt Engineering:**
+**✍️ Gemini-Powered Prompt Engineering & Studio Guide:**
 
 - **Prompt Rewriting:** Automatically enhance and expand user prompts for superior generation results.
-- **Multimodal Critic:** Evaluate and provide iterative feedback on generated media.
+- **Multimodal Critic:** Use Gemini's multimodal understanding to evaluate and provide feedback on generated images.
+- **GMP Features Hub (`/gmp`) & Contextual Help Assistant:** Explore Generative Media Pro (VPE) capabilities in a dedicated tab, inspect contextual tab/model configurations from the right-side **Help Me** drawer, and ask questions powered by **Gemini 3 Flash** (`POST /api/gemini/assistant`).
 
 **📄 Brand Guidelines Integration:**
 
@@ -120,10 +117,10 @@ The backend follows a **Modular, Feature-Driven Architecture**, heavily inspired
 | :----------------- | :------------------------------------------------------- |
 | **Frontend**       | Angular, TypeScript, Angular Material, Tailwind CSS      |
 | **Backend**        | Python, FastAPI, Pydantic                                |
-| **Database**       | Google Cloud SQL (PostgreSQL, Private VPC IP)            |
+| **Database**       | Google Cloud SQL (PostgreSQL)                            |
 | **Cloud Provider** | Google Cloud Platform (GCP)                              |
-| **Deployment**     | Cloud Run (Direct VPC Egress), Firebase Hosting, Terraform (`infrastructure/`) |
-| **AI Models**      | Nano Banana, Imagen 4, Gemini Omni, Veo 3.1 / VPE, Lyria 3, Chirp 3, Gemini TTS |
+| **Deployment**     | Cloud Run (for backend), Firebase Hosting (for frontend) |
+| **AI Models**      | Imagen, Veo, Gemini (via Vertex AI SDK)                  |
 
 ### Dependencies
 
@@ -141,8 +138,6 @@ Regarding the dependencies of the APIs and Services we’ll use (the Google APIs
 - `compute.googleapis.com` (Compute Engine)
 - `firebase.googleapis.com` (Firebase)
 - `sqladmin.googleapis.com` (Cloud SQL)
-- `servicenetworking.googleapis.com` (Private Services Access for Cloud SQL)
-- `vpcaccess.googleapis.com` (Direct VPC Egress)
 - `iamcredentials.googleapis.com` (IAM Service API)
 - `iap.googleapis.com` (Cloud Identity-Aware Proxy)
 - `identitytoolkit.googleapis.com` (Identity Platform)
@@ -157,7 +152,7 @@ For the deployment you can use CloudShell which already has all of the necessary
 - `jq` (JSON processor)
 - `firebase-tools` (Firebase CLI)
 - `uv` (Python package installer)
-- `terraform` (version 1.14.1 or newer)
+- `terraform` (version 1.13.0 or newer)
 
 ## 🛡️ Quality Standards & CI/CD
 

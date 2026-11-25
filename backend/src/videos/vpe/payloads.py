@@ -58,6 +58,13 @@ from typing import Any, Callable, Mapping
 
 from src.videos.vpe.capabilities import (
     MIME_EXR,
+    MIME_MP3,
+    MIME_MP4,
+    MIME_MPEG,
+    MIME_MXF,
+    MIME_PNG,
+    MIME_QUICKTIME,
+    MIME_WAV,
     VpeCapability,
     VpeCapabilityId,
     VpeCodec,
@@ -66,7 +73,9 @@ from src.videos.vpe.capabilities import (
     VpeInstanceFieldSpec,
     VpeParameterLocation,
     VpeParameterSpec,
+    VpeSuperResMode,
     VpeUpscaleResolution,
+    VpeValueType,
     get_capability,
 )
 
@@ -187,15 +196,125 @@ class VpeSeamlessFlags:
     tessellate_vertical: bool = False
 
 
+_TARGET_AUDIO_MIME_TYPES = frozenset(
+    {
+        MIME_WAV,
+        MIME_MP3,
+        MIME_MPEG,
+        "audio/aac",
+        "audio/mp4",
+        MIME_MP4,
+        MIME_QUICKTIME,
+    }
+)
+
+_OMNI_TRANSFORM_VIDEO_MIME_TYPES = frozenset(
+    {
+        MIME_MP4,
+        MIME_QUICKTIME,
+        MIME_MXF,
+        MIME_PNG,
+        MIME_EXR,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VpeAudioControl:
+    """Audio steering inside ``experiments.customParameters.audioControl``.
+
+    ``target_audio`` and ``use_target_audio_from_video`` are mutually exclusive.
+    """
+
+    target_audio: VpeMediaRef | None = None
+    use_target_audio_from_video: bool | None = None
+
+    def __post_init__(self) -> None:
+        """Enforces mutual exclusion and Cloud Storage media rules."""
+        if (
+            self.target_audio is not None
+            and self.use_target_audio_from_video is not None
+        ):
+            raise VpePayloadError(
+                "audioControl.targetAudio and"
+                " audioControl.useTargetAudioFromVideo are mutually exclusive",
+            )
+        if (
+            self.target_audio is None
+            and self.use_target_audio_from_video is None
+        ):
+            raise VpePayloadError(
+                "audioControl requires either targetAudio or"
+                " useTargetAudioFromVideo",
+            )
+        if self.target_audio is not None:
+            if self.target_audio.bytes_base64 is not None:
+                raise VpePayloadError(
+                    "audioControl.targetAudio must be a Cloud Storage URI",
+                )
+            if (
+                self.target_audio.mime_type.lower()
+                not in _TARGET_AUDIO_MIME_TYPES
+            ):
+                raise VpePayloadError(
+                    "audioControl.targetAudio has unsupported mimeType"
+                    f" {self.target_audio.mime_type!r}",
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class VpeOmniVideoTransform:
+    """Omni-Cine ``experiments.customParameters.videoTransform`` block."""
+
+    initialization_video: VpeMediaRef
+    noise_strength: float | None = None
+    mask: VpeMediaRef | None = None
+
+    def __post_init__(self) -> None:
+        """Validates initialization video, noiseStrength range, and mask."""
+        if self.initialization_video.bytes_base64 is not None:
+            raise VpePayloadError(
+                "videoTransform.initializationVideo must be a Cloud Storage"
+                " URI",
+            )
+        if (
+            self.initialization_video.mime_type.lower()
+            not in _OMNI_TRANSFORM_VIDEO_MIME_TYPES
+        ):
+            raise VpePayloadError(
+                "videoTransform.initializationVideo has unsupported mimeType"
+                f" {self.initialization_video.mime_type!r}",
+            )
+        if self.noise_strength is not None and (
+            isinstance(self.noise_strength, bool)
+            or not 0.0 <= self.noise_strength <= 1.0
+        ):
+            raise VpePayloadError(
+                "videoTransform.noiseStrength must be between 0.0 and 1.0,"
+                f" got {self.noise_strength!r}",
+            )
+        if self.mask is not None:
+            if self.mask.bytes_base64 is not None:
+                raise VpePayloadError(
+                    "videoTransform.mask must be a Cloud Storage URI",
+                )
+            if (
+                self.mask.mime_type.lower()
+                not in _OMNI_TRANSFORM_VIDEO_MIME_TYPES
+            ):
+                raise VpePayloadError(
+                    "videoTransform.mask has unsupported mimeType"
+                    f" {self.mask.mime_type!r}",
+                )
+
+
 @dataclass(frozen=True, slots=True)
 class VpeRequest:
-    """Everything any VPE capability can be asked for.
+    """Everything any VPE / GMP capability can be asked for.
 
-    One flat shape covering all eight capabilities, because the alternative
-    - eight request classes - pushes the "which capability is this?" branch
-    into every caller before it can even build the object. Anything the
-    chosen capability does not accept is refused by name at build time, so
-    the flatness cannot turn into a silently ignored field.
+    One flat shape covering every capability. Anything the chosen capability
+    does not accept is refused by name at build time, so flatness cannot turn
+    into a silently ignored field.
     """
 
     capability_id: VpeCapabilityId
@@ -212,12 +331,18 @@ class VpeRequest:
     resolution: str | None = None
     aspect_ratio: str | None = None
     sharpness: int | None = None
+    fps: int | None = None
     video_transform_strength: float | None = None
     num_diffusion_steps: int | None = None
     video_transform_mask_gcs_uri: str | None = None
     conditioning_frames: tuple[VpeConditioningFrame, ...] = ()
     perf_mesh_gcs_uri: str | None = None
     seamless: VpeSeamlessFlags | None = None
+    super_res_mode: str | None = None
+    super_res_steps: int | None = None
+    exr_color_space_override: str | None = None
+    audio_control: VpeAudioControl | None = None
+    omni_video_transform: VpeOmniVideoTransform | None = None
 
     def __post_init__(self) -> None:
         """Rejects an output destination VPE could not write to."""
@@ -263,6 +388,7 @@ _SCALAR_SLOTS: tuple[_ScalarSlot, ...] = (
     _ScalarSlot("resolution", "resolution", VpeParameterLocation.PARAMETERS),
     _ScalarSlot("aspect_ratio", "aspectRatio", VpeParameterLocation.PARAMETERS),
     _ScalarSlot("sharpness", "sharpness", VpeParameterLocation.PARAMETERS),
+    _ScalarSlot("fps", "fps", VpeParameterLocation.PARAMETERS),
     _ScalarSlot("codec", "codec", VpeParameterLocation.EXPERIMENTS),
     _ScalarSlot(
         "video_transform_strength",
@@ -283,6 +409,21 @@ _SCALAR_SLOTS: tuple[_ScalarSlot, ...] = (
         "perf_mesh_gcs_uri",
         "perfMeshGcsUri",
         VpeParameterLocation.EXPERIMENTS,
+    ),
+    _ScalarSlot(
+        "super_res_mode",
+        "mode",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES,
+    ),
+    _ScalarSlot(
+        "super_res_steps",
+        "steps",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES,
+    ),
+    _ScalarSlot(
+        "exr_color_space_override",
+        "exrColorSpaceOverride",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM,
     ),
 )
 
@@ -400,6 +541,10 @@ def _check_scalar_value(
         VpePayloadError: If the value is not one the docs allow.
     """
     label = f"{capability.capability_id.value} {spec.json_path}"
+    if spec.value_type is VpeValueType.INTEGER and (
+        isinstance(value, bool) or not isinstance(value, int)
+    ):
+        raise VpePayloadError(f"{label} must be an integer, got {value!r}")
     if spec.allowed_values and value not in spec.allowed_values:
         raise VpePayloadError(
             f"{label} must be one of {list(spec.allowed_values)},"
@@ -426,7 +571,7 @@ def _check_group_slots(
     capability: VpeCapability,
     request: VpeRequest,
 ) -> None:
-    """Checks the two non-scalar parameters: seamless and keyframes.
+    """Checks structured group parameters against the capability.
 
     Args:
         capability: The registry entry being built for.
@@ -451,6 +596,24 @@ def _check_group_slots(
         raise VpePayloadError(
             f"{capability.capability_id.value} does not accept"
             " conditioningFrames",
+        )
+    has_audio_control = capability.parameter(
+        "targetAudio",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_AUDIO_CONTROL,
+    )
+    if request.audio_control is not None and has_audio_control is None:
+        raise VpePayloadError(
+            f"{capability.capability_id.value} does not accept"
+            " customParameters.audioControl",
+        )
+    has_omni_transform = capability.parameter(
+        "initializationVideo",
+        VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM,
+    )
+    if request.omni_video_transform is not None and has_omni_transform is None:
+        raise VpePayloadError(
+            f"{capability.capability_id.value} does not accept"
+            " customParameters.videoTransform",
         )
 
 
@@ -900,27 +1063,140 @@ def _build_upscale_seamless(
     return payload
 
 
-def _check_exr_references_have_an_exr_video(request: VpeRequest) -> None:
-    """Rejects EXR reference images without an EXR input video.
+def _audio_control_block(control: VpeAudioControl) -> dict[str, Any]:
+    """Renders ``experiments.customParameters.audioControl``."""
+    if control.target_audio is not None:
+        return {
+            "targetAudio": {
+                _KEY_GCS_URI: control.target_audio.gcs_uri,
+                _KEY_MIME_TYPE: control.target_audio.mime_type.lower(),
+            }
+        }
+    return {
+        "useTargetAudioFromVideo": bool(control.use_target_audio_from_video)
+    }
 
-    The omni-cine instances table qualifies the reference mime type as
-    "EXR: image/x-exr (requires EXR input video)" and the input size table
-    repeats the parenthetical. The rule spans two instance fields, so the
-    per-field mime check cannot see it and preflight, which measures one
-    file at a time, cannot either.
 
-    Args:
-        request: The caller's request.
+def _omni_video_transform_block(
+    transform: VpeOmniVideoTransform,
+) -> dict[str, Any]:
+    """Renders ``experiments.customParameters.videoTransform``."""
+    block: dict[str, Any] = {
+        "initializationVideo": {
+            _KEY_GCS_URI: transform.initialization_video.gcs_uri,
+            _KEY_MIME_TYPE: transform.initialization_video.mime_type.lower(),
+        }
+    }
+    if transform.noise_strength is not None:
+        block["noiseStrength"] = float(transform.noise_strength)
+    if transform.mask is not None:
+        block["mask"] = {
+            _KEY_GCS_URI: transform.mask.gcs_uri,
+            _KEY_MIME_TYPE: transform.mask.mime_type.lower(),
+        }
+    return block
 
-    Raises:
-        VpePayloadError: If any reference is EXR and the video is not.
+
+def _build_super_res(
+    capability: VpeCapability,
+    request: VpeRequest,
+) -> dict[str, Any]:
+    """Builds the ``veo-exp-super-res`` request body.
+
+    Enforces GMP Super Resolution parameter rules:
+    - ``customParameters.superResConfig.mode`` is required.
+    - ``fps`` is accepted only for PNG/EXR image sequences, omitted for video
+      containers.
+    - ``codec`` must be omitted when ``compressionQuality`` is
+      ``lossless_16bit_png`` or the input is EXR.
+    - ``exrColorSpaceOverride`` is valid only for EXR inputs.
+    - At ``MODE_8K``, ``lossless_16bit_png`` and ``dnxhr`` + ``lossless`` are
+      disallowed.
     """
+    if request.super_res_mode is None:
+        raise VpePayloadError(
+            "super_res requires"
+            " parameters.experiments.customParameters.superResConfig.mode",
+        )
+    mode = _enum_value(request.super_res_mode)
+    quality = _enum_value(request.compression_quality)
+    codec = _enum_value(request.codec)
+    video_mime = request.video.mime_type.lower()
+    is_exr = video_mime == MIME_EXR
+    is_sequence = (
+        video_mime in (MIME_PNG, MIME_EXR) or request.video.is_sequence
+    )
+
+    if request.fps is not None and not is_sequence:
+        raise VpePayloadError(
+            "super_res parameters.fps is only supported for image sequences;"
+            " omit fps for video containers",
+        )
+    if codec is not None and (
+        quality == VpeCompressionQuality.LOSSLESS_16BIT_PNG.value or is_exr
+    ):
+        raise VpePayloadError(
+            "super_res experiments.codec must be omitted for"
+            " lossless_16bit_png or EXR",
+        )
+    if request.exr_color_space_override is not None and not is_exr:
+        raise VpePayloadError(
+            "super_res customParameters.exrColorSpaceOverride is only"
+            " supported for EXR inputs",
+        )
+    if mode == VpeSuperResMode.MODE_8K.value:
+        if quality == VpeCompressionQuality.LOSSLESS_16BIT_PNG.value:
+            raise VpePayloadError(
+                "super_res MODE_8K does not support lossless_16bit_png",
+            )
+        if (
+            codec == VpeCodec.DNXHR.value
+            and quality == VpeCompressionQuality.LOSSLESS.value
+        ):
+            raise VpePayloadError(
+                "super_res MODE_8K does not support lossless DNxHR",
+            )
+
+    instance, parameters, experiments = _start(capability, request)
+    instance[VpeInstanceField.VIDEO.value] = _media(
+        capability,
+        VpeInstanceField.VIDEO,
+        request.video,
+    )
+    _set_if(parameters, "compressionQuality", request.compression_quality)
+    _set_if(parameters, "sharpness", request.sharpness)
+    _set_if(parameters, "fps", request.fps)
+    _set_if(parameters, "seed", request.seed)
+    _set_if(experiments, "codec", request.codec)
+
+    super_res_config: dict[str, Any] = {"mode": mode}
+    _set_if(super_res_config, "steps", request.super_res_steps)
+    custom_params: dict[str, Any] = {"superResConfig": super_res_config}
+    _set_if(
+        custom_params,
+        "exrColorSpaceOverride",
+        request.exr_color_space_override,
+    )
+    experiments["customParameters"] = custom_params
+    return _finish(instance, parameters)
+
+
+def _check_exr_references_have_an_exr_video(request: VpeRequest) -> None:
+    """Rejects EXR reference images without an EXR input video."""
     has_exr_reference = any(
         ref.mime_type.lower() == MIME_EXR for ref in request.reference_images
     )
     if not has_exr_reference:
         return
-    if request.video is None or request.video.mime_type.lower() != MIME_EXR:
+    has_exr_video = (
+        request.video is not None
+        and request.video.mime_type.lower() == MIME_EXR
+    ) or (
+        request.omni_video_transform is not None
+        and request.omni_video_transform.initialization_video.mime_type.lower()
+        == MIME_EXR
+    )
+    if not has_exr_video:
         raise VpePayloadError(
             "omni-cine EXR reference images require an EXR input video",
         )
@@ -930,16 +1206,18 @@ def _build_omni_cine(
     capability: VpeCapability,
     request: VpeRequest,
 ) -> dict[str, Any]:
-    """Builds the Omni-Cine body.
-
-    Args:
-        capability: The omni-cine registry entry.
-        request: The caller's request.
-
-    Returns:
-        The request body.
-    """
+    """Builds the Omni-Cine body."""
     _check_exr_references_have_an_exr_video(request)
+    if request.last_frame is not None and request.image is None:
+        raise VpePayloadError(
+            "omni-cine instances[].lastFrame requires instances[].image",
+        )
+    if request.reference_audios and request.audio_control is not None:
+        raise VpePayloadError(
+            "omni-cine instances[].referenceAudios and"
+            " customParameters.audioControl are mutually exclusive",
+        )
+
     instance, parameters, experiments = _start(capability, request)
     instance[VpeInstanceField.PROMPT.value] = request.prompt
     if request.video is not None:
@@ -948,13 +1226,74 @@ def _build_omni_cine(
             VpeInstanceField.VIDEO,
             request.video,
         )
+    if request.image is not None:
+        instance[VpeInstanceField.IMAGE.value] = _media(
+            capability,
+            VpeInstanceField.IMAGE,
+            request.image,
+        )
+    if request.last_frame is not None:
+        instance[VpeInstanceField.LAST_FRAME.value] = _media(
+            capability,
+            VpeInstanceField.LAST_FRAME,
+            request.last_frame,
+        )
     if request.reference_images:
         instance[VpeInstanceField.REFERENCE_IMAGES.value] = _reference_images(
             capability,
             request.reference_images,
         )
+    if request.reference_audios:
+        instance[VpeInstanceField.REFERENCE_AUDIOS.value] = _reference_audios(
+            capability,
+            request.reference_audios,
+        )
+
     _set_if(parameters, "compressionQuality", request.compression_quality)
     _set_if(experiments, "codec", request.codec)
+
+    custom_params: dict[str, Any] = {}
+    _set_if(
+        custom_params,
+        "exrColorSpaceOverride",
+        request.exr_color_space_override,
+    )
+    if request.omni_video_transform is not None:
+        custom_params["videoTransform"] = _omni_video_transform_block(
+            request.omni_video_transform
+        )
+    if request.audio_control is not None:
+        custom_params["audioControl"] = _audio_control_block(
+            request.audio_control
+        )
+    if custom_params:
+        experiments["customParameters"] = custom_params
+
+    return _finish(instance, parameters)
+
+
+def _build_omni_perf(
+    capability: VpeCapability,
+    request: VpeRequest,
+) -> dict[str, Any]:
+    """Builds the Omni-Perf body."""
+    instance, parameters, experiments = _start(capability, request)
+    instance[VpeInstanceField.PROMPT.value] = request.prompt
+    instance[VpeInstanceField.VIDEO.value] = _media(
+        capability,
+        VpeInstanceField.VIDEO,
+        request.video,
+    )
+    instance[VpeInstanceField.REFERENCE_IMAGES.value] = _reference_images(
+        capability,
+        request.reference_images,
+    )
+    _set_if(parameters, "compressionQuality", request.compression_quality)
+    _set_if(experiments, "codec", request.codec)
+    if request.audio_control is not None:
+        experiments["customParameters"] = {
+            "audioControl": _audio_control_block(request.audio_control)
+        }
     return _finish(instance, parameters)
 
 
@@ -1189,9 +1528,11 @@ def _build_builders() -> Mapping[VpeCapabilityId, _Builder]:
     builders: dict[VpeCapabilityId, _Builder] = {
         VpeCapabilityId.UPSCALE: _build_upscale,
         VpeCapabilityId.UPSCALE_SEAMLESS: _build_upscale_seamless,
+        VpeCapabilityId.SUPER_RES: _build_super_res,
         VpeCapabilityId.OMNI_CINE: _build_omni_cine,
         VpeCapabilityId.VIDEO_TRANSFORM: _build_video_transform,
         VpeCapabilityId.PERF_ESTIMATION: _build_perf_estimation,
+        VpeCapabilityId.OMNI_PERF: _build_omni_perf,
         VpeCapabilityId.PERF_GENERATION: _build_perf_generation,
         VpeCapabilityId.DIALOGUE_DRIVEN: _build_dialogue_driven,
         VpeCapabilityId.VIDEO_TEXTURES: _build_video_textures,

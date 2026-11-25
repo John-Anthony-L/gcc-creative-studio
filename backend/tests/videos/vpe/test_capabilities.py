@@ -152,9 +152,13 @@ def test_orientation_is_set_and_consistent(capability: VpeCapability):
         VpeParameterLocation.PARAMETERS,
     )
     if capability.orientation is VpeOrientation.PORTRAIT_OK:
-        # Portrait is only claimable if there is a way to ask for it.
-        assert aspect_ratio is not None
-        assert "9:16" in aspect_ratio.allowed_values
+        has_ar_param = (
+            aspect_ratio is not None and "9:16" in aspect_ratio.allowed_values
+        )
+        has_portrait_input = capability.input_video is not None and any(
+            size.is_portrait for size in capability.input_video.frame_sizes
+        )
+        assert has_ar_param or has_portrait_input
     else:
         assert all(size.is_landscape for size in capability.frame_sizes)
 
@@ -165,18 +169,17 @@ def test_only_the_upscaler_supports_portrait():
         for capability in VPE_CAPABILITY_LIST
         if capability.orientation is VpeOrientation.PORTRAIT_OK
     }
-    assert portrait == {VpeCapabilityId.UPSCALE}
+    assert portrait == {VpeCapabilityId.UPSCALE, VpeCapabilityId.SUPER_RES}
 
     landscape_only = {
         capability.capability_id
         for capability in VPE_CAPABILITY_LIST
         if capability.orientation is VpeOrientation.LANDSCAPE_ONLY
     }
-    # The three the docs say "Landscape 16:9 orientation only" about; the
-    # rest are the unstated-fixed-frame tier and must not be lumped in.
     assert landscape_only == {
         VpeCapabilityId.VIDEO_TRANSFORM,
         VpeCapabilityId.PERF_ESTIMATION,
+        VpeCapabilityId.OMNI_PERF,
         VpeCapabilityId.PERF_GENERATION,
     }
 
@@ -247,9 +250,11 @@ def test_one_checkpoint_can_back_two_capabilities():
 
 def test_documented_reference_image_caps():
     assert get_capability(VpeCapabilityId.OMNI_CINE).max_reference_images == 7
+    assert get_capability(VpeCapabilityId.OMNI_PERF).max_reference_images == 5
     perf = get_capability(VpeCapabilityId.PERF_GENERATION)
     assert perf.max_reference_images == 5
     assert get_capability(VpeCapabilityId.UPSCALE).max_reference_images == 0
+    assert get_capability(VpeCapabilityId.SUPER_RES).max_reference_images == 0
 
 
 def test_documented_frame_bounds():
@@ -264,13 +269,17 @@ def test_documented_frame_bounds():
     assert omni.input_video.max_frames == 240
 
     for capability_id in (
+        VpeCapabilityId.SUPER_RES,
         VpeCapabilityId.PERF_ESTIMATION,
-        VpeCapabilityId.PERF_GENERATION,
+        VpeCapabilityId.OMNI_PERF,
     ):
         constraints = get_capability(capability_id).input_video
         assert constraints is not None
-        # Exactly 192 frames, not "about 8 seconds".
-        assert constraints.min_frames == constraints.max_frames == 192
+        assert (constraints.min_frames, constraints.max_frames) == (1, 240)
+
+    legacy_perf = get_capability(VpeCapabilityId.PERF_GENERATION).input_video
+    assert legacy_perf is not None
+    assert legacy_perf.min_frames == legacy_perf.max_frames == 192
 
     transform = get_capability(VpeCapabilityId.VIDEO_TRANSFORM).input_video
     assert transform is not None
@@ -368,9 +377,6 @@ def test_frame_sequence_flag_must_match_the_formats():
 
 def test_vpe_config_ships_off_and_regional():
     """VPE_LOCATION cannot reuse LOCATION, which defaults to 'global'."""
-    # Imported here rather than at module scope: config_service builds a
-    # settings instance on import, so it needs conftest's credential mocks in
-    # place first, and the registry tests should not depend on that at all.
     from src.config.config_service import ConfigService
 
     fields = ConfigService.model_fields
@@ -379,3 +385,38 @@ def test_vpe_config_ships_off_and_regional():
     assert fields["VPE_BUCKET"].default == ""
     assert fields["VPE_DRY_RUN"].default is False
     assert fields["LOCATION"].default == "global"
+
+
+def test_super_res_capability_declares_cinema_and_8k_sizes_and_modes():
+    super_res = get_capability(VpeCapabilityId.SUPER_RES)
+    assert super_res.model_name == "veo-exp-super-res"
+    assert super_res.output.produces_audio is True
+    assert super_res.parameter("aspectRatio") is None
+    assert super_res.supports(VpeInstanceField.PROMPT) is False
+
+    mode = super_res.parameter(
+        "mode", VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES
+    )
+    assert mode is not None and mode.is_required
+    assert mode.allowed_values == ("MODE_4K", "MODE_4K_PRO", "MODE_8K")
+
+    in_sizes = {str(s) for s in super_res.input_video.frame_sizes}
+    assert {"1365x720", "2048x1080", "4096x2160", "3840x2160"} <= in_sizes
+    out_sizes = {str(s) for s in super_res.output.frame_sizes}
+    assert {"7680x4320", "8192x4320", "4320x7680", "4320x8192"} <= out_sizes
+
+
+def test_omni_perf_and_omni_cine_declare_gmp_custom_parameters():
+    omni_perf = get_capability(VpeCapabilityId.OMNI_PERF)
+    assert omni_perf.model_name == "omni-perf"
+    ref_spec = omni_perf.instance_field(VpeInstanceField.REFERENCE_IMAGES)
+    assert ref_spec is not None
+    assert ref_spec.reference_type == "ASSET"
+    assert "image/webp" in ref_spec.mime_types
+
+    omni_cine = get_capability(VpeCapabilityId.OMNI_CINE)
+    assert omni_cine.supports(VpeInstanceField.IMAGE)
+    assert omni_cine.supports(VpeInstanceField.LAST_FRAME)
+    assert omni_cine.supports(VpeInstanceField.REFERENCE_AUDIOS)
+    audio_spec = omni_cine.instance_field(VpeInstanceField.REFERENCE_AUDIOS)
+    assert audio_spec is not None and audio_spec.max_items == 3

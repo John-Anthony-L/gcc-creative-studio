@@ -15,13 +15,15 @@
  */
 
 import {HttpClient} from '@angular/common/http';
-import {Injectable} from '@angular/core';
+import {Injectable, signal} from '@angular/core';
 import {MatSnackBar} from '@angular/material/snack-bar';
 import {
   BehaviorSubject,
   catchError,
   EMPTY,
   Observable,
+  of,
+  shareReplay,
   Subscription,
   switchMap,
   tap,
@@ -31,6 +33,7 @@ import {environment} from '../../../environments/environment';
 import {JobStatus, MediaItem} from '../../common/models/media-item.model';
 import {
   UpscaleVideoDto,
+  VpeConfigResponse,
   VpeScreeningResponse,
 } from '../../common/models/vpe.model';
 import {
@@ -50,6 +53,10 @@ import {
   providedIn: 'root',
 })
 export class VpeService {
+  readonly vpeEnabled = signal<boolean>(false);
+  readonly vpeConfigLoaded = signal<boolean>(false);
+
+  private configRequest$: Observable<VpeConfigResponse> | null = null;
   private activeUpscaleJob = new BehaviorSubject<MediaItem | null>(null);
   public activeUpscaleJob$ = this.activeUpscaleJob.asObservable();
   private upscalePollingSubscription: Subscription | null = null;
@@ -58,6 +65,29 @@ export class VpeService {
     private http: HttpClient,
     private _snackBar: MatSnackBar,
   ) {}
+
+  /**
+   * Fetches and memoizes backend VPE configuration so GMP capabilities are
+   * dynamically gated without redundant network requests.
+   */
+  loadConfig(): Observable<VpeConfigResponse> {
+    if (!this.configRequest$) {
+      const url = `${environment.backendURL}/videos/vpe/config`;
+      this.configRequest$ = this.http.get<VpeConfigResponse>(url).pipe(
+        tap(cfg => {
+          this.vpeEnabled.set(!!cfg?.enabled);
+          this.vpeConfigLoaded.set(true);
+        }),
+        catchError(() => {
+          this.vpeEnabled.set(false);
+          this.vpeConfigLoaded.set(true);
+          return of({enabled: false, capabilities: []});
+        }),
+        shareReplay(1),
+      );
+    }
+    return this.configRequest$;
+  }
 
   private isJobFinished(item: MediaItem): boolean {
     return (

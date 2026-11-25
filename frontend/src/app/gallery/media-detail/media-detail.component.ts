@@ -222,6 +222,10 @@ export class MediaDetailComponent implements OnDestroy {
     });
   }
 
+  get isVpeEnabled(): boolean {
+    return this.vpeService.vpeEnabled();
+  }
+
   /**
    * Checks whether the loaded item is worth offering the upscale action on.
    *
@@ -244,13 +248,19 @@ export class MediaDetailComponent implements OnDestroy {
       return;
     }
 
-    this.vpeService.screenForUpscale(this.mediaItem.id).subscribe({
-      next: screening => {
-        this.vpeScreening = screening;
-      },
-      error: err => {
-        console.error('VPE screening failed', err);
-      },
+    const targetId = this.mediaItem.id;
+    this.vpeService.loadConfig().subscribe(cfg => {
+      if (!cfg.enabled || this.mediaItem?.id !== targetId) {
+        return;
+      }
+      this.vpeService.screenForUpscale(targetId).subscribe({
+        next: screening => {
+          this.vpeScreening = screening;
+        },
+        error: err => {
+          console.error('VPE screening failed', err);
+        },
+      });
     });
   }
 

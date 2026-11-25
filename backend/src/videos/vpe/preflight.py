@@ -62,6 +62,7 @@ from src.videos.vpe.capabilities import (
     MIME_PNG,
     MIME_QUICKTIME,
     MIME_WAV,
+    MIME_WEBP,
     VPE_FPS,
     FrameSize,
     VpeAudioConstraints,
@@ -720,6 +721,22 @@ def _check_fps(
                 required=f"{VPE_FPS} fps",
             ),
         ]
+    if capability.capability_id is VpeCapabilityId.SUPER_RES:
+        if 1.0 <= float(probe.fps) <= 120.0:
+            return []
+        return [
+            VpeFinding(
+                code=VpeReasonCode.FPS_MISMATCH,
+                severity=VpeSeverity.BLOCK,
+                message=(
+                    f"This clip is {_fps_label(probe.fps)};"
+                    f" {capability.label} accepts 1 to 120 fps."
+                ),
+                remedy="Re-encode within 1 to 120 fps.",
+                measured=_fps_label(probe.fps),
+                required="1-120 fps",
+            ),
+        ]
     if probe.fps != VPE_REQUIRED_FPS:
         # A clip whose declared base rate disagrees with its measured
         # average is variable-rate, and the tools a user is likely to check
@@ -1048,7 +1065,9 @@ def _check_incoming_audio_track(
     Returns:
         A single warning, or nothing.
     """
-    if not probe.has_audio:
+    if not probe.has_audio or (
+        capability.capability_id is VpeCapabilityId.SUPER_RES
+    ):
         return []
     if capability.has_known_issue(VpeKnownIssueId.OMNI_CINE_NO_AUDIO_INPUT):
         return [
@@ -1492,6 +1511,7 @@ def _image_mime(codec: str | None) -> str | None:
         "png": MIME_PNG,
         "mjpeg": MIME_JPEG,
         "jpeg": MIME_JPEG,
+        "webp": MIME_WEBP,
         "exr": MIME_EXR,
     }.get(codec or "")
 

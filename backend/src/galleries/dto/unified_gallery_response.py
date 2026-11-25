@@ -80,6 +80,7 @@ class UnifiedGalleryItemResponse(BaseModel):
     # Presigned URLs will be injected by the service
     presigned_urls: list[str] = []
     presigned_thumbnail_urls: list[str] = []
+    master_presigned_urls: list[str] | None = None
 
     # For compatibility with frontend expecting specific fields at top level,
     # we might want to flatten metadata or keep it nested.

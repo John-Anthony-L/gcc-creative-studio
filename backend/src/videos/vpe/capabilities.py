@@ -55,6 +55,7 @@ MIME_QUICKTIME = "video/quicktime"  # ProRes .mov
 MIME_MXF = "application/mxf"  # DNxHR .mxf
 MIME_PNG = "image/png"  # also a 16-bit PNG frame sequence, via a glob gcsUri
 MIME_JPEG = "image/jpeg"
+MIME_WEBP = "image/webp"
 MIME_EXR = "image/x-exr"
 MIME_WAV = "audio/wav"
 MIME_MP3 = "audio/mp3"  # non-standard, but what the doc lists
@@ -69,20 +70,20 @@ VPE_FPS = 24
 
 
 class VpeCapabilityId(str, Enum):
-    """Stable identifiers for the capabilities in the VPE program.
+    """Stable identifiers for the capabilities in the VPE / GMP program.
 
-    Eight capabilities, seven checkpoints: seamless upscaling is the same
-    ``veo3p1_upscale`` model as the plain upscaler driven with the
-    ``experiments.seamless`` flags, but its inputs, its legal output
-    resolutions and its failure modes differ enough that collapsing the two
-    would mean re-deriving the difference at every call site.
+    Includes ``super_res`` (``veo-exp-super-res``) and ``omni_perf``
+    (``omni-perf``) from the Nov 21, 2026 GMP User Guide alongside legacy
+    ``perf_generation`` (turns down Dec 2026).
     """
 
     UPSCALE = "upscale"
     UPSCALE_SEAMLESS = "upscale_seamless"
+    SUPER_RES = "super_res"
     OMNI_CINE = "omni_cine"
     VIDEO_TRANSFORM = "video_transform"
     PERF_ESTIMATION = "perf_estimation"
+    OMNI_PERF = "omni_perf"
     PERF_GENERATION = "perf_generation"
     DIALOGUE_DRIVEN = "dialogue_driven"
     VIDEO_TEXTURES = "video_textures"
@@ -92,18 +93,10 @@ class VpeOrientation(str, Enum):
     """What the docs say about orientation, kept in three states.
 
     The third state is the honest one and the reason this is not a boolean.
-    Only the upscaler documents portrait support, and only the upscaler
-    exposes an ``aspectRatio`` parameter. Video transform and both
+    Only the upscalers document portrait support. Video transform and the
     performance models say "Landscape 16:9 orientation only" outright. The
-    remaining three say nothing about orientation at all - they simply state
-    a fixed 1280x720 frame and offer no way to ask for anything else.
-
-    Recording that as LANDSCAPE_ONLY would invent a documented restriction
-    that does not exist, and recording it as portrait-capable would invite a
-    720x1280 input that gets pillarboxed into 1280x720 (leaving roughly
-    405x720 of real subject pixels) without ever raising an error. Callers
-    should treat FIXED_FRAME_UNSTATED as "landscape in practice, unconfirmed
-    by the docs" and say so in the UI rather than pretending either way.
+    remaining capabilities state a fixed 1280x720 frame and offer no way to
+    ask for anything else.
     """
 
     PORTRAIT_OK = "portrait_ok"
@@ -141,12 +134,22 @@ class VpeParameterLocation(str, Enum):
     Values are dotted JSON paths so a payload builder can place a parameter
     from the registry alone. The nesting is the single easiest thing to get
     wrong: ``storageUri`` is top level, ``modelName`` is one level down in
-    ``experiments``, and the seamless flags are two levels down.
+    ``experiments``, and custom / seamless blocks sit two or three levels down.
     """
 
     PARAMETERS = "parameters"
     EXPERIMENTS = "parameters.experiments"
     EXPERIMENTS_SEAMLESS = "parameters.experiments.seamless"
+    EXPERIMENTS_CUSTOM = "parameters.experiments.customParameters"
+    EXPERIMENTS_CUSTOM_SUPER_RES = (
+        "parameters.experiments.customParameters.superResConfig"
+    )
+    EXPERIMENTS_CUSTOM_AUDIO_CONTROL = (
+        "parameters.experiments.customParameters.audioControl"
+    )
+    EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM = (
+        "parameters.experiments.customParameters.videoTransform"
+    )
 
 
 class VpeFieldRequirement(str, Enum):
@@ -173,6 +176,7 @@ class VpeValueType(str, Enum):
     NUMBER = "number"
     BOOLEAN = "boolean"
     ARRAY = "array"
+    OBJECT = "object"
 
 
 class VpeCodec(str, Enum):
@@ -199,6 +203,21 @@ class VpeUpscaleResolution(str, Enum):
 
     HD_1080P = "1080p"
     UHD_4K = "4k"
+
+
+class VpeSuperResMode(str, Enum):
+    """Accepted values of ``customParameters.superResConfig.mode``."""
+
+    MODE_4K = "MODE_4K"
+    MODE_4K_PRO = "MODE_4K_PRO"
+    MODE_8K = "MODE_8K"
+
+
+class VpeExrColorSpace(str, Enum):
+    """Accepted values of ``customParameters.exrColorSpaceOverride``."""
+
+    LIN_AP0 = "lin_ap0"
+    LIN_AP1 = "lin_ap1"
 
 
 class VpeOutputFormat(str, Enum):
@@ -277,12 +296,49 @@ class FrameSize:
         return f"{self.width}x{self.height}"
 
 
+# Consumer (16:9 / 9:16) frame sizes
 FRAME_720P = FrameSize(1280, 720)
 FRAME_720P_PORTRAIT = FrameSize(720, 1280)
 FRAME_1080P = FrameSize(1920, 1080)
 FRAME_1080P_PORTRAIT = FrameSize(1080, 1920)
 FRAME_4K = FrameSize(3840, 2160)
 FRAME_4K_PORTRAIT = FrameSize(2160, 3840)
+FRAME_8K = FrameSize(7680, 4320)
+FRAME_8K_PORTRAIT = FrameSize(4320, 7680)
+
+# Cinema (256:135 / 135:256) frame sizes
+FRAME_720P_CINEMA = FrameSize(1365, 720)
+FRAME_720P_CINEMA_PORTRAIT = FrameSize(720, 1365)
+FRAME_2K_DCI = FrameSize(2048, 1080)
+FRAME_2K_DCI_PORTRAIT = FrameSize(1080, 2048)
+FRAME_4K_DCI = FrameSize(4096, 2160)
+FRAME_4K_DCI_PORTRAIT = FrameSize(2160, 4096)
+FRAME_8K_DCI = FrameSize(8192, 4320)
+FRAME_8K_DCI_PORTRAIT = FrameSize(4320, 8192)
+
+SUPER_RES_INPUT_FRAME_SIZES: tuple[FrameSize, ...] = (
+    FRAME_720P,
+    FRAME_720P_PORTRAIT,
+    FRAME_1080P,
+    FRAME_1080P_PORTRAIT,
+    FRAME_4K,
+    FRAME_4K_PORTRAIT,
+    FRAME_720P_CINEMA,
+    FRAME_720P_CINEMA_PORTRAIT,
+    FRAME_2K_DCI,
+    FRAME_2K_DCI_PORTRAIT,
+    FRAME_4K_DCI,
+    FRAME_4K_DCI_PORTRAIT,
+)
+
+SUPER_RES_4K_INPUT_SIZES: frozenset[FrameSize] = frozenset(
+    {
+        FRAME_4K,
+        FRAME_4K_PORTRAIT,
+        FRAME_4K_DCI,
+        FRAME_4K_DCI_PORTRAIT,
+    }
+)
 
 _MIB = 1024 * 1024
 
@@ -654,13 +710,17 @@ class VpeCapability:
             "aspectRatio",
             VpeParameterLocation.PARAMETERS,
         )
+        has_portrait_video_inputs = self.input_video is not None and any(
+            size.is_portrait for size in self.input_video.frame_sizes
+        )
         if (
             self.orientation is VpeOrientation.PORTRAIT_OK
             and aspect_ratio is None
+            and not has_portrait_video_inputs
         ):
             raise ValueError(
                 f"{self.capability_id.value} claims portrait support with no"
-                " aspectRatio parameter to request it",
+                " aspectRatio parameter or portrait input video sizes",
             )
         if self.orientation is not VpeOrientation.PORTRAIT_OK:
             portrait = [size for size in self.frame_sizes if size.is_portrait]
@@ -897,6 +957,42 @@ _UPSCALE_COMPRESSION_QUALITY = VpeParameterSpec(
     ),
 )
 
+_EXR_COLOR_SPACE_OVERRIDE = VpeParameterSpec(
+    name="exrColorSpaceOverride",
+    location=VpeParameterLocation.EXPERIMENTS_CUSTOM,
+    requirement=VpeFieldRequirement.OPTIONAL,
+    value_type=VpeValueType.STRING,
+    allowed_values=tuple(cs.value for cs in VpeExrColorSpace),
+    notes="EXR scene-linear color space override (lin_ap0 or lin_ap1).",
+)
+
+_AUDIO_CONTROL_TARGET_AUDIO = VpeParameterSpec(
+    name="targetAudio",
+    location=VpeParameterLocation.EXPERIMENTS_CUSTOM_AUDIO_CONTROL,
+    requirement=VpeFieldRequirement.OPTIONAL,
+    value_type=VpeValueType.OBJECT,
+    notes=(
+        "Cloud Storage audio object {gcsUri, mimeType}. Mutually exclusive"
+        " with useTargetAudioFromVideo."
+    ),
+)
+
+_AUDIO_CONTROL_USE_FROM_VIDEO = VpeParameterSpec(
+    name="useTargetAudioFromVideo",
+    location=VpeParameterLocation.EXPERIMENTS_CUSTOM_AUDIO_CONTROL,
+    requirement=VpeFieldRequirement.OPTIONAL,
+    value_type=VpeValueType.BOOLEAN,
+    notes=(
+        "Use the audio track from the input video. Mutually exclusive with"
+        " targetAudio."
+    ),
+)
+
+_AUDIO_CONTROL_PARAMETERS = (
+    _AUDIO_CONTROL_TARGET_AUDIO,
+    _AUDIO_CONTROL_USE_FROM_VIDEO,
+)
+
 
 VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
     VpeCapability(
@@ -1025,10 +1121,6 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
             "The same upscaler driven with the seamless flags, taking a"
             " tessellated or looping 720p clip to 4K without seams."
         ),
-        # Same checkpoint as the plain upscaler, so aspectRatio exists, but
-        # this doc pins the input to the 1280x720 that video textures emits
-        # and never mentions orientation: there is no documented route to a
-        # portrait tessellated source.
         orientation=VpeOrientation.FIXED_FRAME_UNSTATED,
         doc_url=f"{_DOC_BASE}/upscaling-tessellation",
         instance_fields=(
@@ -1128,15 +1220,128 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
         ),
     ),
     VpeCapability(
+        capability_id=VpeCapabilityId.SUPER_RES,
+        model_name="veo-exp-super-res",
+        label="Super Resolution (4K / 4K Pro / 8K)",
+        description=(
+            "GMP Super Resolution upsampler supporting 4K, 4K Pro and 8K"
+            " Consumer and Cinema DCI formats up to 240 frames while"
+            " preserving native frame rate and 48 kHz audio."
+        ),
+        orientation=VpeOrientation.PORTRAIT_OK,
+        doc_url=f"{_DOC_BASE}/super-resolution",
+        instance_fields=(
+            VpeInstanceFieldSpec(
+                field=VpeInstanceField.VIDEO,
+                requirement=VpeFieldRequirement.REQUIRED,
+                mime_types=(
+                    MIME_MP4,
+                    MIME_QUICKTIME,
+                    MIME_MXF,
+                    MIME_PNG,
+                    MIME_EXR,
+                ),
+                notes=(
+                    "Accepts H.264 MP4, ProRes MOV, DNxHR MXF, and 16-bit PNG"
+                    " or EXR frame sequences (glob gcsUri). No prompt,"
+                    " aspectRatio, resolution, durationSeconds or sampleCount"
+                    " allowed."
+                ),
+            ),
+        ),
+        parameters=(
+            _model_name_parameter("veo-exp-super-res"),
+            _STORAGE_URI,
+            _UPSCALE_COMPRESSION_QUALITY,
+            VpeParameterSpec(
+                name="sharpness",
+                location=VpeParameterLocation.PARAMETERS,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                value_type=VpeValueType.INTEGER,
+                minimum=0,
+                maximum=4,
+                default=4,
+                notes="Sharpening strength 0..4 (default 4 for super-res).",
+            ),
+            VpeParameterSpec(
+                name="fps",
+                location=VpeParameterLocation.PARAMETERS,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                value_type=VpeValueType.INTEGER,
+                minimum=1,
+                maximum=120,
+                notes=(
+                    "Frame rate for PNG/EXR image sequences only (1..120);"
+                    " omit for video containers."
+                ),
+            ),
+            _SEED,
+            _CODEC,
+            VpeParameterSpec(
+                name="mode",
+                location=VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES,
+                requirement=VpeFieldRequirement.REQUIRED,
+                value_type=VpeValueType.STRING,
+                allowed_values=tuple(mode.value for mode in VpeSuperResMode),
+                notes="Target super-resolution tier: MODE_4K, MODE_4K_PRO, MODE_8K.",
+            ),
+            VpeParameterSpec(
+                name="steps",
+                location=VpeParameterLocation.EXPERIMENTS_CUSTOM_SUPER_RES,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                value_type=VpeValueType.INTEGER,
+                minimum=1,
+                maximum=2,
+                notes="Optional diffusion step count (1 or 2).",
+            ),
+            _EXR_COLOR_SPACE_OVERRIDE,
+        ),
+        input_video=VpeVideoConstraints(
+            min_frames=1,
+            max_frames=240,
+            frame_sizes=SUPER_RES_INPUT_FRAME_SIZES,
+            notes=(
+                "1 to 240 frames; Consumer (16:9/9:16) and Cinema"
+                " (256:135/135:256); 4K inputs allowed only with MODE_8K."
+            ),
+        ),
+        output=VpeOutputSpec(
+            frame_sizes=(
+                FRAME_4K,
+                FRAME_4K_PORTRAIT,
+                FRAME_4K_DCI,
+                FRAME_4K_DCI_PORTRAIT,
+                FRAME_8K,
+                FRAME_8K_PORTRAIT,
+                FRAME_8K_DCI,
+                FRAME_8K_DCI_PORTRAIT,
+            ),
+            formats=(
+                VpeOutputFormat.H264_MP4,
+                VpeOutputFormat.PRORES_MOV,
+                VpeOutputFormat.DNXHR_MXF,
+                VpeOutputFormat.PNG16_SEQUENCE,
+                VpeOutputFormat.EXR16_SEQUENCE,
+            ),
+            max_frames=240,
+            produces_audio=True,
+            emits_frame_sequence=True,
+            notes=(
+                "Preserves native FPS, aspect ratio, and 48 kHz audio. At"
+                " MODE_8K, lossless_16bit_png and lossless DNxHR are"
+                " disallowed."
+            ),
+        ),
+    ),
+    VpeCapability(
         capability_id=VpeCapabilityId.OMNI_CINE,
         model_name="omni-cine",
         label="Omni-Cine",
         description=(
             "The Omni model on professional plumbing: EXR and 16-bit PNG"
-            " sequences in and out, ProRes/DNxHR previews, up to 240 frames."
+            " sequences in and out, ProRes/DNxHR masters, I2V, V2V"
+            " videoTransform, and audio control up to 240 frames."
         ),
-        # States a 1280x720 output and exposes no aspectRatio; the docs never
-        # discuss orientation for this model.
         orientation=VpeOrientation.FIXED_FRAME_UNSTATED,
         doc_url=f"{_DOC_BASE}/omni-cine",
         instance_fields=(
@@ -1160,15 +1365,38 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
                 ),
             ),
             VpeInstanceFieldSpec(
+                field=VpeInstanceField.IMAGE,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                mime_types=(MIME_PNG, MIME_JPEG, MIME_WEBP, MIME_EXR),
+                notes="Optional opening first frame.",
+            ),
+            VpeInstanceFieldSpec(
+                field=VpeInstanceField.LAST_FRAME,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                mime_types=(MIME_PNG, MIME_JPEG, MIME_WEBP, MIME_EXR),
+                notes="Optional closing frame (requires instances[].image).",
+            ),
+            VpeInstanceFieldSpec(
                 field=VpeInstanceField.REFERENCE_IMAGES,
                 requirement=VpeFieldRequirement.OPTIONAL,
-                mime_types=(MIME_PNG, MIME_JPEG, MIME_EXR),
+                mime_types=(MIME_PNG, MIME_JPEG, MIME_WEBP, MIME_EXR),
                 max_items=7,
                 reference_type="asset",
                 notes=(
                     "referenceType is lowercase 'asset' here and uppercase"
-                    " 'ASSET' for performance generation. EXR references"
-                    " require an EXR input video."
+                    " 'ASSET' for omni-perf / performance generation. EXR"
+                    " references require an EXR input video."
+                ),
+            ),
+            VpeInstanceFieldSpec(
+                field=VpeInstanceField.REFERENCE_AUDIOS,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                mime_types=(MIME_WAV, MIME_MP3, MIME_MPEG),
+                max_items=3,
+                notes=(
+                    "Up to 3 reference audio objects {audio: {gcsUri,"
+                    " mimeType}}, mutually exclusive with customParameters"
+                    ".audioControl."
                 ),
             ),
         ),
@@ -1177,6 +1405,31 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
             _STORAGE_URI,
             _COMPRESSION_QUALITY,
             _CODEC,
+            _EXR_COLOR_SPACE_OVERRIDE,
+            VpeParameterSpec(
+                name="initializationVideo",
+                location=VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                value_type=VpeValueType.OBJECT,
+                notes="Source clip {gcsUri, mimeType} for Omni-Cine videoTransform.",
+            ),
+            VpeParameterSpec(
+                name="noiseStrength",
+                location=VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                value_type=VpeValueType.NUMBER,
+                minimum=0.0,
+                maximum=1.0,
+                notes="Restyle noise strength 0.0..1.0 for Omni-Cine videoTransform.",
+            ),
+            VpeParameterSpec(
+                name="mask",
+                location=VpeParameterLocation.EXPERIMENTS_CUSTOM_VIDEO_TRANSFORM,
+                requirement=VpeFieldRequirement.OPTIONAL,
+                value_type=VpeValueType.OBJECT,
+                notes="Optional mask video {gcsUri, mimeType} for localized edits.",
+            ),
+            *_AUDIO_CONTROL_PARAMETERS,
         ),
         input_video=VpeVideoConstraints(
             min_frames=1,
@@ -1194,8 +1447,14 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
             any_resolution=True,
             max_bytes=30 * _MIB,
             notes=(
-                "Reference images may be any resolution, but a 1280x720 crop"
-                " around the region of interest gives the best detail."
+                "Reference and conditioning images may be any resolution, up"
+                " to 30 MiB."
+            ),
+        ),
+        input_audio=VpeAudioConstraints(
+            notes=(
+                "Up to 3 reference audio tracks in instances[].referenceAudios,"
+                " mutually exclusive with customParameters.audioControl."
             ),
         ),
         output=VpeOutputSpec(
@@ -1214,17 +1473,10 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
             notes=(
                 "Preview videos carry generated audio and the folder also"
                 " holds sample_0_audio.wav. Output length matches the input"
-                " video; text- or image-only requests emit 240 frames. EXR"
-                " output keeps the input resolution and colour space, so it"
-                " is the one case where output is not 1280x720."
+                " video; text- or image-only requests emit 240 frames."
             ),
         ),
         known_issues=(
-            VpeKnownIssue(
-                issue_id=VpeKnownIssueId.OMNI_CINE_NO_AUDIO_INPUT,
-                summary="Audio input is not supported.",
-                workaround="Do not offer the audio-reference slot here.",
-            ),
             VpeKnownIssue(
                 issue_id=VpeKnownIssueId.OMNI_CINE_NO_VIDEO_REFERENCES,
                 summary=(
@@ -1232,8 +1484,7 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
                     " video plus still references."
                 ),
                 workaround=(
-                    "The app's existing Omni edit flow sends video plus"
-                    " images, so it cannot be re-pointed at omni-cine."
+                    "Use instances[].video or customParameters.videoTransform."
                 ),
             ),
             VpeKnownIssue(
@@ -1406,7 +1657,7 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
         label="Performance estimation (blue mesh)",
         description=(
             "Step 1 of performance control: extracts an actor's movement and"
-            " expression from a video as a blue-mesh clip."
+            " expression from a video as a blue-mesh clip (up to 10s)."
         ),
         orientation=VpeOrientation.LANDSCAPE_ONLY,
         doc_url=f"{_DOC_BASE}/performance-controls",
@@ -1424,21 +1675,21 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
             _SEED,
         ),
         input_video=VpeVideoConstraints(
-            min_frames=192,
-            max_frames=192,
+            min_frames=1,
+            max_frames=240,
             frame_sizes=(FRAME_720P,),
             notes=(
-                "Exactly 192 frames (8s) at exactly 24 fps; the source is not"
-                " rescaled, so 1280x720 landscape is the only input."
+                "1 to 240 frames (up to 10s) at exactly 24 fps; 1280x720"
+                " landscape input."
             ),
         ),
         output=VpeOutputSpec(
             frame_sizes=(FRAME_720P,),
             formats=(VpeOutputFormat.H264_MP4,),
-            max_frames=192,
+            max_frames=240,
             notes=(
-                "The blue-mesh clip. Feed its gcsUri to performance"
-                " generation as experiments.perfMeshGcsUri."
+                "The blue-mesh clip. Feed its gcsUri to omni-perf as"
+                " instances[].video."
             ),
         ),
         notes=(
@@ -1446,12 +1697,82 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
         ),
     ),
     VpeCapability(
+        capability_id=VpeCapabilityId.OMNI_PERF,
+        model_name="omni-perf",
+        label="Omni-Perf (character performance transfer)",
+        description=(
+            "Drives a generated character from 1-5 reference images and a"
+            " blue-mesh performance clip up to 240 frames with audio control."
+        ),
+        orientation=VpeOrientation.LANDSCAPE_ONLY,
+        doc_url=f"{_DOC_BASE}/omni-perf",
+        instance_fields=(
+            VpeInstanceFieldSpec(
+                field=VpeInstanceField.PROMPT,
+                requirement=VpeFieldRequirement.REQUIRED,
+                notes="Scene and performance prompt guiding generation.",
+            ),
+            VpeInstanceFieldSpec(
+                field=VpeInstanceField.VIDEO,
+                requirement=VpeFieldRequirement.REQUIRED,
+                mime_types=(MIME_MP4, MIME_QUICKTIME, MIME_MXF),
+                notes=(
+                    "1280x720 24 fps 1-240 frame blue-mesh performance clip"
+                    " from veo-exp-perf-estimation."
+                ),
+            ),
+            VpeInstanceFieldSpec(
+                field=VpeInstanceField.REFERENCE_IMAGES,
+                requirement=VpeFieldRequirement.REQUIRED,
+                mime_types=(MIME_PNG, MIME_JPEG, MIME_WEBP),
+                max_items=5,
+                reference_type="ASSET",
+                notes="1 to 5 character reference images (uppercase ASSET).",
+            ),
+        ),
+        parameters=(
+            _model_name_parameter("omni-perf"),
+            _STORAGE_URI,
+            _COMPRESSION_QUALITY,
+            _CODEC,
+            *_AUDIO_CONTROL_PARAMETERS,
+        ),
+        input_video=VpeVideoConstraints(
+            min_frames=1,
+            max_frames=240,
+            frame_sizes=(FRAME_720P,),
+            notes="1 to 240 frames at 24 fps, 1280x720.",
+        ),
+        input_image=VpeImageConstraints(
+            any_resolution=True,
+            max_bytes=30 * _MIB,
+            notes="Character reference images (PNG, JPEG, WebP).",
+        ),
+        output=VpeOutputSpec(
+            frame_sizes=(FRAME_720P,),
+            formats=(
+                VpeOutputFormat.H264_MP4,
+                VpeOutputFormat.PRORES_MOV,
+                VpeOutputFormat.DNXHR_MXF,
+                VpeOutputFormat.PNG16_SEQUENCE,
+            ),
+            max_frames=240,
+            produces_audio=True,
+            has_audio_stem=True,
+            emits_frame_sequence=True,
+            notes=(
+                "Generates synchronized audio or applies audioControl"
+                " (targetAudio or useTargetAudioFromVideo)."
+            ),
+        ),
+    ),
+    VpeCapability(
         capability_id=VpeCapabilityId.PERF_GENERATION,
         model_name="veo-exp-perf-generation",
-        label="Performance generation",
+        label="Performance generation (deprecated)",
         description=(
-            "Step 2 of performance control: drives a generated character with"
-            " a blue-mesh clip plus reference images and a prompt."
+            "Deprecated (turns down Dec 2026; use omni-perf): drives a"
+            " generated character with a blue-mesh clip plus reference images."
         ),
         orientation=VpeOrientation.LANDSCAPE_ONLY,
         doc_url=f"{_DOC_BASE}/performance-controls",
@@ -1521,7 +1842,7 @@ VPE_CAPABILITY_LIST: tuple[VpeCapability, ...] = (
             ),
             max_frames=192,
             emits_frame_sequence=True,
-            notes="The docs do not state whether audio is generated.",
+            notes="Deprecated; replaced by omni-perf.",
         ),
         max_prompt_chars=1000,
     ),

@@ -46,7 +46,7 @@
         [showOmniButton]="true"
         [showExtendButton]="true"
         [showConcatenateButton]="true"
-        [showUpscaleButton]="true"
+        [showUpscaleButton]="isVpeEnabled"
         [vpeScreening]="vpeScreening"
         (editClicked)="generateWithThisImage($event)"
         (generateVideoClicked)="generateVideoWithImage($event)"

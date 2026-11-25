@@ -104,6 +104,16 @@ export interface ModelCapability {
    * Whether the model supports intermediate keyframe conditioning for multi-keyframe transform.
    */
   supportsConditioningFrames?: boolean;
+  /** Whether the model requires backend VPE / GMP allowlist access. */
+  requiresVpe?: boolean;
+  /** Whether the model supports actor performance / Blue Mesh control (omni-perf). */
+  supportsPerformanceControl?: boolean;
+  /** Whether the model supports seamless temporal loop and spatial tiling (veo-exp-video-textures). */
+  supportsSeamlessLoop?: boolean;
+  /** Whether the model supports mezzanine ProRes / DNxHR output delivery formats. */
+  supportsProFormats?: boolean;
+  /** Whether the model supports explicit audio control mode selection (omni-cine / omni-perf). */
+  supportsAudioControlMode?: boolean;
 }
 
 export interface GenerationModelConfig {
@@ -435,6 +445,72 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       restrictsDurationOutsideTextToVideo: true,
     },
   },
+  // --- GMP (Generative Media Pro / VPE) Video Models ---
+  {
+    value: 'omni-cine',
+    viewValue: 'Omni-Cine',
+    type: 'VIDEO',
+    icon: 'movie_filter',
+    capabilities: {
+      supportedModes: [
+        'Text to Video',
+        'Frames to Video',
+        'Ingredients to Video',
+        'Edit Video',
+      ],
+      maxReferenceImages: 7,
+      supportedAspectRatios: ['16:9'],
+      supportedResolutions: ['1K'],
+      supportedDurations: [4, 5, 6, 7, 8, 9, 10],
+      supportsAudio: true,
+      supportsAudioReference: true,
+      supportsAudioControlMode: true,
+      supportsLastFrame: true,
+      supportsMask: true,
+      supportsTransformStrength: true,
+      supportsProFormats: true,
+      maxOutputs: 1,
+      requiresVpe: true,
+    },
+  },
+  {
+    value: 'omni-perf',
+    viewValue: 'Omni-Perf Character Control',
+    type: 'VIDEO',
+    icon: 'accessibility_new',
+    capabilities: {
+      supportedModes: ['Ingredients to Video'],
+      maxReferenceImages: 5,
+      supportedAspectRatios: ['16:9'],
+      supportedResolutions: ['1K'],
+      supportedDurations: [4, 5, 6, 7, 8, 9, 10],
+      supportsAudio: true,
+      supportsVideoReference: true,
+      maxReferenceVideos: 1,
+      supportsAudioReference: true,
+      supportsAudioControlMode: true,
+      supportsPerformanceControl: true,
+      supportsProFormats: true,
+      maxOutputs: 1,
+      requiresVpe: true,
+    },
+  },
+  {
+    value: 'veo-exp-perf-estimation',
+    viewValue: '2D Performance Estimation (Blue Mesh)',
+    type: 'VIDEO',
+    icon: 'directions_run',
+    capabilities: {
+      supportedModes: ['Edit Video'],
+      maxReferenceImages: 0,
+      supportedAspectRatios: ['16:9'],
+      supportedResolutions: ['1K'],
+      supportedDurations: [4, 5, 6, 7, 8, 9, 10],
+      supportsSeed: true,
+      maxOutputs: 1,
+      requiresVpe: true,
+    },
+  },
   {
     value: 'veo-exp-a2v-generation',
     viewValue: 'Veo Dialogue Lip Sync',
@@ -451,12 +527,14 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       supportsLastFrame: false,
       supportsNegativePrompt: false,
       supportsVideoReference: false,
+      supportsProFormats: true,
       maxOutputs: 1,
+      requiresVpe: true,
     },
   },
   {
     value: 'veo-exp-video-transform',
-    viewValue: 'Veo Video Transform / Restyle',
+    viewValue: 'Veo Video Transform / Keyframes',
     type: 'VIDEO',
     icon: 'auto_fix_high',
     capabilities: {
@@ -473,7 +551,28 @@ export const MODEL_CONFIGS: GenerationModelConfig[] = [
       supportsTransformStrength: true,
       supportsDiffusionSteps: true,
       supportsSeed: true,
+      supportsProFormats: true,
       maxOutputs: 1,
+      requiresVpe: true,
+    },
+  },
+  {
+    value: 'veo-exp-video-textures',
+    viewValue: 'Veo Video Textures (Loop & Tile)',
+    type: 'VIDEO',
+    icon: 'grid_on',
+    capabilities: {
+      supportedModes: ['Text to Video', 'Frames to Video'],
+      maxReferenceImages: 0,
+      supportedAspectRatios: ['16:9'],
+      supportedResolutions: ['1K'],
+      supportedDurations: [8],
+      supportsLastFrame: true,
+      supportsSeed: true,
+      supportsSeamlessLoop: true,
+      supportsProFormats: true,
+      maxOutputs: 1,
+      requiresVpe: true,
     },
   },
 

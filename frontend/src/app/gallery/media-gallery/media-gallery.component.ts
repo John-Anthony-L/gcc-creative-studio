@@ -241,20 +241,19 @@ export class MediaGalleryComponent implements OnInit, OnDestroy, AfterViewInit {
     @Inject(PLATFORM_ID) platformId: Object,
   ) {
     this.isBrowser = isPlatformBrowser(platformId);
+    const iconPath = 'assets/images';
     this.matIconRegistry
       .addSvgIcon(
         'mobile-white-gemini-spark-icon',
-        this.setPath(`${this.path}/mobile-white-gemini-spark-icon.svg`),
+        this.setPath(`${iconPath}/mobile-white-gemini-spark-icon.svg`),
       )
       .addSvgIcon(
         'gemini-spark-icon',
-        this.setPath(`${this.path}/gemini-spark-icon.svg`),
+        this.setPath(`${iconPath}/gemini-spark-icon.svg`),
       );
     const user = this.userService.getUserDetails();
     this.userId = user?.id as number;
   }
-
-  private path = '../../assets/images';
 
   private setPath(url: string): SafeResourceUrl {
     return this.sanitizer.bypassSecurityTrustResourceUrl(url);

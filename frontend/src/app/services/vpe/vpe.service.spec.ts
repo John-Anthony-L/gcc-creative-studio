@@ -26,6 +26,7 @@ import {environment} from '../../../environments/environment';
 import {JobStatus, MediaItem} from '../../common/models/media-item.model';
 import {
   UpscaleVideoDto,
+  VpeConfigResponse,
   VpeScreeningResponse,
   VpeUpscaleResolution,
 } from '../../common/models/vpe.model';
@@ -35,6 +36,7 @@ describe('VpeService', () => {
   let httpMock: HttpTestingController;
 
   const JOB_ID = 42;
+  const configUrl = `${environment.backendURL}/videos/vpe/config`;
   const upscaleUrl = `${environment.backendURL}/videos/vpe/upscale`;
   const itemUrl = `${environment.backendURL}/gallery/item/${JOB_ID}`;
 
@@ -89,6 +91,49 @@ describe('VpeService', () => {
 
   it('should be created', () => {
     expect(service).toBeTruthy();
+    expect(service.vpeEnabled()).toBeFalse();
+    expect(service.vpeConfigLoaded()).toBeFalse();
+  });
+
+  describe('loadConfig', () => {
+    it('fetches config, updates signals, and memoizes subsequent calls', () => {
+      const config: VpeConfigResponse = {
+        enabled: true,
+        capabilities: ['video_upscale', 'gmp_models'],
+      };
+      let first: VpeConfigResponse | undefined;
+      let second: VpeConfigResponse | undefined;
+
+      service.loadConfig().subscribe(val => (first = val));
+      service.loadConfig().subscribe(val => (second = val));
+
+      const req = httpMock.expectOne(configUrl);
+      expect(req.request.method).toBe('GET');
+      req.flush(config);
+
+      expect(first).toEqual(config);
+      expect(second).toEqual(config);
+      expect(service.vpeEnabled()).toBeTrue();
+      expect(service.vpeConfigLoaded()).toBeTrue();
+
+      let third: VpeConfigResponse | undefined;
+      service.loadConfig().subscribe(val => (third = val));
+      httpMock.expectNone(configUrl);
+      expect(third).toEqual(config);
+    });
+
+    it('falls back to disabled config on HTTP error', () => {
+      let received: VpeConfigResponse | undefined;
+
+      service.loadConfig().subscribe(val => (received = val));
+
+      const req = httpMock.expectOne(configUrl);
+      req.flush('Server Error', {status: 500, statusText: 'Server Error'});
+
+      expect(received).toEqual({enabled: false, capabilities: []});
+      expect(service.vpeEnabled()).toBeFalse();
+      expect(service.vpeConfigLoaded()).toBeTrue();
+    });
   });
 
   describe('screenForUpscale', () => {

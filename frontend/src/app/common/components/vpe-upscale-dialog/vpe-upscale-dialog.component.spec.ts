@@ -56,11 +56,13 @@ describe('VpeUpscaleDialogComponent', () => {
 
   const screeningWith = (
     findings: VpeFindingResponse[],
+    supportedModes?: string[],
   ): VpeScreeningResponse => ({
     capability_id: 'video_upscale',
     screening: 'not_ruled_out',
     offer: true,
     findings,
+    ...(supportedModes ? {supported_modes: supportedModes} : {}),
   });
 
   const build = (screening: VpeScreeningResponse) => {
@@ -103,22 +105,34 @@ describe('VpeUpscaleDialogComponent', () => {
     expect(component).toBeTruthy();
   });
 
-  describe('defaults', () => {
-    beforeEach(() => build(screeningWith([])));
+  describe('defaults & supported_modes', () => {
+    it('offers 4K first and starts there when supported_modes is absent', () => {
+      build(screeningWith([]));
 
-    it('offers 4K first and starts there', () => {
+      expect(component.upscaleMode).toBe('4k');
       expect(component.resolution).toBe(VpeUpscaleResolution.UHD_4K);
-      expect(component.resolutionOptions[0].value).toBe(
-        VpeUpscaleResolution.UHD_4K,
-      );
-    });
-
-    it('starts at the sharpness the backend parameter itself defaults to', () => {
+      expect(component.modeOptions[0].value).toBe('4k');
+      expect(component.steps).toBe(1);
       expect(component.sharpness).toBe(1);
+      expect(component.outputCodec).toBe('h264');
+      expect(component.compressionQuality).toBe('optimized');
+      expect(component.isSubmitting).toBeFalse();
     });
 
-    it('is not submitting before anything is clicked', () => {
-      expect(component.isSubmitting).toBeFalse();
+    it('filters modes to supported_modes and defaults to first supported when 4k is excluded', () => {
+      build(screeningWith([], ['8k']));
+
+      expect(component.modeOptions.map(o => o.value)).toEqual(['8k']);
+      expect(component.upscaleMode).toBe('8k');
+      expect(component.resolution).toBe(VpeUpscaleResolution.UHD_4K);
+    });
+
+    it('does not offer DNxHR Lossless in delivery formats', () => {
+      build(screeningWith([]));
+
+      expect(
+        component.deliveryFormatOptions.some(o => o.value === 'dnxhr_lossless'),
+      ).toBeFalse();
     });
   });
 
@@ -158,8 +172,8 @@ describe('VpeUpscaleDialogComponent', () => {
   describe('confirm', () => {
     beforeEach(() => build(screeningWith([])));
 
-    it('sends the dialog data and the current selections', () => {
-      component.onResolutionChange(VpeUpscaleResolution.HD_1080P);
+    it('sends 1080p without steps and maps resolution to HD_1080P', () => {
+      component.onModeChange('1080p');
       component.onSharpnessChange(3);
 
       component.confirm();
@@ -169,7 +183,31 @@ describe('VpeUpscaleDialogComponent', () => {
         mediaItemId: 77,
         mediaIndex: 1,
         resolution: VpeUpscaleResolution.HD_1080P,
+        upscaleMode: '1080p',
         sharpness: 3,
+        outputCodec: 'h264',
+        compressionQuality: 'optimized',
+      });
+    });
+
+    it('sends Super Resolution 4K Pro with steps and ProRes 4444 Lossless', () => {
+      component.onModeChange('4k_pro');
+      component.onStepsChange(2);
+      component.onSharpnessChange(2);
+      component.onDeliveryFormatChange('prores_lossless');
+
+      component.confirm();
+
+      expect(vpeService.startUpscale).toHaveBeenCalledWith({
+        workspaceId: 3,
+        mediaItemId: 77,
+        mediaIndex: 1,
+        resolution: VpeUpscaleResolution.UHD_4K,
+        upscaleMode: '4k_pro',
+        steps: 2,
+        sharpness: 2,
+        outputCodec: 'prores',
+        compressionQuality: 'lossless',
       });
     });
 

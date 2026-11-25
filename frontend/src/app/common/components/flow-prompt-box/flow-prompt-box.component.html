@@ -136,6 +136,16 @@
             <span>{{ seed === null ? 'Seed auto' : 'Seed ' + seed }}</span>
           </button>
         }
+        @if (proFormatBadgeLabel; as proBadge) {
+          <button
+            (click)="toggleSettingsMenu(); $event.stopPropagation()"
+            [matTooltip]="'Delivery Format: ' + selectedDeliveryFormatLabel + ' (Click to adjust)'"
+            class="rounded-md bg-neutral-800 px-2 py-1 cursor-pointer hover:bg-neutral-700 font-mono text-xs text-amber-300 flex items-center gap-1"
+          >
+            <mat-icon class="!text-xs !h-3.5 !w-3.5 flex items-center justify-center">high_quality</mat-icon>
+            <span>{{ proBadge }}</span>
+          </button>
+        }
       </div>
     </div>
 
@@ -165,8 +175,13 @@
     <div class="flex flex-wrap items-end justify-between gap-y-4">
       <!-- Left: Drag-and-drop areas -->
       <div class="flex flex-wrap items-center gap-3">
+        <div *ngIf="mode === 'Frames to Video' && supportsSeamlessLoop && seamlessLoop"
+          class="text-[11px] text-neutral-400 flex items-center gap-1.5">
+          <mat-icon class="!h-3.5 !w-3.5 !text-xs text-blue-400">loop</mat-icon>
+          <span>Temporal Loop is active — uncheck Temporal Loop in settings to attach start/end frames.</span>
+        </div>
         <!-- Frames to Video / Concatenate / Extend Inputs -->
-        <ng-container *ngIf="mode === 'Frames to Video' || mode === 'Concatenate Video' || mode === 'Extend Video'">
+        <ng-container *ngIf="(mode === 'Frames to Video' || mode === 'Concatenate Video' || mode === 'Extend Video') && !(supportsSeamlessLoop && seamlessLoop)">
           <!-- Slot 1: Always shown for these modes -->
           <div
             class="relative h-20 w-20 cursor-pointer rounded-xl border-2 border-dashed border-neutral-700 bg-neutral-800 transition-colors hover:border-neutral-500 hover:bg-neutral-700 flex items-center justify-center"
@@ -329,7 +344,7 @@
           </div>
 
           <!-- Gemini Omni specific prompt tips -->
-          <ng-container *ngIf="!supportsTransformStrength">
+          <ng-container *ngIf="getSelectedModelObject()?.value?.startsWith('gemini-omni')">
             <div class="w-full text-[11px] text-neutral-500">
               Describe only what should change. Adding
               <span class="font-mono text-neutral-400">Keep everything else the same</span>
@@ -343,6 +358,10 @@
               <span class="text-neutral-600">(needed when using reference images)</span>
             </label>
           </ng-container>
+          <div *ngIf="getSelectedModelObject()?.value === 'veo-exp-perf-estimation'"
+            class="w-full text-[11px] text-neutral-400">
+            Extracts a 2D Blue Mesh performance video from the selected actor clip.
+          </div>
         </ng-container>
 
         <!--
@@ -431,32 +450,6 @@
               </div>
             </ng-container>
 
-            <!--
-              Audio Reference Slot. Gated on capability, not on a model name:
-              no current video model accepts an audio reference. Omni's API
-              takes the part and ignores it, so offering the control invited
-              silent failure - and now a rejected request.
-            -->
-            <div *ngIf="mode === 'Ingredients to Video' && getSelectedModelObject()?.capabilities?.supportsAudioReference"
-              class="relative h-20 w-20 cursor-pointer rounded-xl border-2 border-dashed border-neutral-700 bg-neutral-800 transition-colors hover:border-neutral-500 hover:bg-neutral-700 flex flex-col items-center justify-center"
-              (click)="!referenceAudio && openAudioSelectorForReference.emit()"
-            >
-              <ng-container *ngIf="!referenceAudio">
-                <mat-icon class="text-neutral-500">audiotrack</mat-icon>
-                <span class="absolute bottom-1 text-[8px] text-neutral-500">Audio Ref</span>
-              </ng-container>
-              <ng-container *ngIf="referenceAudio">
-                <mat-icon class="text-blue-400 !text-3xl !h-8 !w-8 flex items-center justify-center">music_note</mat-icon>
-                <span class="absolute bottom-1 text-[8px] text-neutral-300 max-w-[64px] truncate">{{ referenceAudio.name || 'Audio' }}</span>
-                <button
-                  (click)="$event.stopPropagation(); clearReferenceAudio.emit($event)"
-                  class="absolute -right-2 -top-2 rounded-full bg-neutral-900 p-0.5 text-neutral-400 hover:text-white"
-                >
-                  <mat-icon class="!h-4 !w-4 text-sm">close</mat-icon>
-                </button>
-              </ng-container>
-            </div>
-
             <!-- Dialogue Lip Sync Portrait note -->
             <div *ngIf="mode === 'Ingredients to Video' && getSelectedModelObject()?.value === 'veo-exp-a2v-generation'"
               class="w-full mt-2 flex items-start gap-1.5 text-[11px] text-neutral-400 leading-relaxed">
@@ -466,6 +459,27 @@
               </span>
             </div>
         </ng-container>
+
+        <!-- Audio Reference Slot (Ingredients to Video or Omni-Cine/Omni-Perf target/reference audio) -->
+        <div *ngIf="showAudioReferenceSlot"
+          class="relative h-20 w-20 cursor-pointer rounded-xl border-2 border-dashed border-neutral-700 bg-neutral-800 transition-colors hover:border-neutral-500 hover:bg-neutral-700 flex flex-col items-center justify-center"
+          (click)="!referenceAudio && openAudioSelectorForReference.emit()"
+        >
+          <ng-container *ngIf="!referenceAudio">
+            <mat-icon class="text-neutral-500">audiotrack</mat-icon>
+            <span class="absolute bottom-1 text-[8px] text-neutral-500">Audio Ref</span>
+          </ng-container>
+          <ng-container *ngIf="referenceAudio">
+            <mat-icon class="text-blue-400 !text-3xl !h-8 !w-8 flex items-center justify-center">music_note</mat-icon>
+            <span class="absolute bottom-1 text-[8px] text-neutral-300 max-w-[64px] truncate">{{ referenceAudio.name || 'Audio' }}</span>
+            <button
+              (click)="$event.stopPropagation(); clearReferenceAudio.emit($event)"
+              class="absolute -right-2 -top-2 rounded-full bg-neutral-900 p-0.5 text-neutral-400 hover:text-white"
+            >
+              <mat-icon class="!h-4 !w-4 text-sm">close</mat-icon>
+            </button>
+          </ng-container>
+        </div>
 
         <!-- Only for Video to Image mode -->
         @if (mode === 'Video to Image') {
@@ -679,13 +693,22 @@
                   [class.bg-neutral-600]="selectedGenerationModel === model.viewValue"
                   [disabled]="isVideoToImage() && !model.capabilities.supportsVideoReference"
                 >
-                  <div class="flex items-center gap-2">
-                    @if (model.isImage) {
-                      <img [src]="model.imageSrc" class="h-5 w-5 object-contain" alt="model icon" />
-                    } @else if (model.isSvg) {
-                      <mat-icon [svgIcon]="model.icon || ''" class="!h-5 !w-5"></mat-icon>
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="flex items-center gap-2 min-w-0">
+                      @if (model.isImage) {
+                        <img [src]="model.imageSrc" class="h-5 w-5 object-contain flex-shrink-0" alt="model icon" />
+                      } @else if (model.isSvg) {
+                        <mat-icon [svgIcon]="model.icon || ''" class="!h-5 !w-5 flex-shrink-0"></mat-icon>
+                      } @else if (model.icon) {
+                        <mat-icon class="!h-4 !w-4 !text-base flex items-center justify-center text-neutral-400 flex-shrink-0">{{ model.icon }}</mat-icon>
+                      }
+                      <span class="truncate">{{ model.viewValue }}</span>
+                    </div>
+                    @if (model.capabilities.requiresVpe) {
+                      <span class="rounded bg-blue-500/20 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-blue-300 flex-shrink-0">
+                        GMP
+                      </span>
                     }
-                    {{ model.viewValue }}
                   </div>
                 </button>
               }
@@ -993,6 +1016,141 @@
           </div>
         }
       </div>
+
+      @if (supportsProFormats || supportsAudioControlMode) {
+        <div class="grid gap-3 mt-3 border-t border-neutral-700/70 pt-3"
+          [class.grid-cols-2]="supportsProFormats && supportsAudioControlMode"
+          [class.grid-cols-1]="!(supportsProFormats && supportsAudioControlMode)"
+        >
+          @if (supportsProFormats) {
+            <div class="relative">
+              <label class="block text-xs font-medium text-neutral-400 mb-1.5">
+                Delivery Format
+              </label>
+              <button
+                type="button"
+                (click)="
+                  $event.stopPropagation();
+                  isSettingsDropdownOpen.set(
+                    isSettingsDropdownOpen() === 'deliveryFormat' ? null : 'deliveryFormat'
+                  )
+                "
+                class="relative w-full flex items-center justify-between rounded-lg bg-neutral-700 px-3 py-2 text-left text-sm"
+              >
+                <span class="truncate">{{ selectedDeliveryFormatLabel }}</span>
+                <mat-icon class="transition-transform flex-shrink-0" [class.rotate-180]="isSettingsDropdownOpen() === 'deliveryFormat'">
+                  expand_more
+                </mat-icon>
+              </button>
+              @if (isSettingsDropdownOpen() === 'deliveryFormat') {
+                <div class="absolute left-0 top-full z-30 mt-1 w-full rounded-lg bg-neutral-700 p-1 shadow-lg">
+                  @for (fmt of deliveryFormatOptions; track fmt.key) {
+                    <button
+                      type="button"
+                      (click)="selectDeliveryFormat(fmt)"
+                      class="block w-full px-3 py-1.5 text-left text-sm rounded hover:bg-neutral-600"
+                      [class.bg-neutral-600]="outputCodec === fmt.codec && compressionQuality === fmt.quality"
+                    >
+                      {{ fmt.label }}
+                    </button>
+                  }
+                </div>
+              }
+            </div>
+          }
+
+          @if (supportsAudioControlMode) {
+            <div class="relative">
+              <label class="block text-xs font-medium text-neutral-400 mb-1.5">
+                Audio Control
+              </label>
+              <button
+                type="button"
+                (click)="
+                  $event.stopPropagation();
+                  isSettingsDropdownOpen.set(
+                    isSettingsDropdownOpen() === 'audioControl' ? null : 'audioControl'
+                  )
+                "
+                class="relative w-full flex items-center justify-between rounded-lg bg-neutral-700 px-3 py-2 text-left text-sm"
+              >
+                <span class="truncate">{{ selectedAudioControlLabel }}</span>
+                <mat-icon class="transition-transform flex-shrink-0" [class.rotate-180]="isSettingsDropdownOpen() === 'audioControl'">
+                  expand_more
+                </mat-icon>
+              </button>
+              @if (isSettingsDropdownOpen() === 'audioControl') {
+                <div class="absolute left-0 top-full z-30 mt-1 w-full rounded-lg bg-neutral-700 p-1 shadow-lg">
+                  @for (audioOpt of availableAudioControlOptions; track audioOpt.value) {
+                    <button
+                      type="button"
+                      (click)="selectAudioControlMode(audioOpt.value)"
+                      class="block w-full px-3 py-1.5 text-left text-sm rounded hover:bg-neutral-600"
+                      [class.bg-neutral-600]="(audioControlMode ?? 'generate') === audioOpt.value"
+                    >
+                      {{ audioOpt.label }}
+                    </button>
+                  }
+                </div>
+              }
+            </div>
+          }
+        </div>
+      }
+
+      @if (supportsPerformanceControl) {
+        <div class="mt-3 border-t border-neutral-700/70 pt-3">
+          <label class="flex cursor-pointer items-center gap-2.5 text-xs font-medium text-neutral-200">
+            <input
+              type="checkbox"
+              [checked]="isBlueMeshInput"
+              (change)="onBlueMeshInputToggle($event)"
+              class="h-3.5 w-3.5 rounded accent-blue-600"
+            />
+            <span>Driving video is already a Blue Mesh</span>
+          </label>
+          <p class="mt-1 pl-6 text-[11px] text-neutral-400">
+            Leave off to auto-extract a 2D Blue Mesh from a raw actor clip
+          </p>
+        </div>
+      }
+
+      @if (supportsSeamlessLoop) {
+        <div class="mt-3 border-t border-neutral-700/70 pt-3">
+          <span class="block text-xs font-medium text-neutral-400 mb-2">
+            Texture Loop &amp; Spatial Tiling
+          </span>
+          <div class="flex flex-wrap items-center gap-4">
+            <label class="flex cursor-pointer items-center gap-2 text-xs text-neutral-200">
+              <input
+                type="checkbox"
+                [checked]="seamlessLoop"
+                (change)="onSeamlessLoopToggle($event)"
+                class="h-3.5 w-3.5 rounded accent-blue-600"
+              />
+              <span>Temporal Loop</span>
+            </label>
+            <label class="flex cursor-pointer items-center gap-2 text-xs text-neutral-200">
+              <input
+                type="checkbox"
+                [checked]="tessellateHorizontal"
+                (change)="onTessellateHorizontalToggle($event)"
+                class="h-3.5 w-3.5 rounded accent-blue-600"
+              />
+              <span>Tile Horizontal</span>
+            </label>
+            <label class="flex cursor-pointer items-center gap-2 text-xs text-neutral-200">
+              <input
+                type="checkbox"
+                [checked]="tessellateVertical"
+                (change)="onTessellateVerticalToggle($event)"
+                class="h-3.5 w-3.5 rounded accent-blue-600"
+              />
+              <span>Tile Vertical</span>
+            </label>
+          </div>
+        </div>
+      }
     </div>
   }
 

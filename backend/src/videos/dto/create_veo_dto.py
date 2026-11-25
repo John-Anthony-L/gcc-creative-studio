@@ -263,10 +263,55 @@ class CreateVeoDto(BaseDto):
         default=None,
         description="Optional intermediate conditioning keyframes (at multiples of 8 frames) for keyframe-guided video transform.",
     )
+    output_codec: Literal["h264", "prores", "dnxhr"] = Field(
+        default="h264",
+        description="GMP output container/codec: h264, prores (.mov), or dnxhr (.mxf).",
+    )
+    compression_quality: Literal["optimized", "lossless"] = Field(
+        default="optimized",
+        description="GMP compression quality profile: optimized or lossless.",
+    )
+    audio_control_mode: (
+        Literal[
+            "generate",
+            "preserve_video_audio",
+            "target_audio",
+            "reference_audio",
+        ]
+        | None
+    ) = Field(
+        default=None,
+        description="Optional GMP audio steering mode for Omni-Perf and Omni-Cine.",
+    )
+    is_blue_mesh_input: bool = Field(
+        default=False,
+        description="True when the driving video for Omni-Perf is already a blue-mesh clip.",
+    )
+    seamless_loop: bool = Field(
+        default=False,
+        description="Enable temporal seamless looping for Video Textures.",
+    )
+    tessellate_horizontal: bool = Field(
+        default=False,
+        description="Enable horizontal spatial tiling for Video Textures.",
+    )
+    tessellate_vertical: bool = Field(
+        default=False,
+        description="Enable vertical spatial tiling for Video Textures.",
+    )
 
     @model_validator(mode="after")
     def validate_cross_fields(self) -> "CreateVeoDto":
         """Performs cross-field model, reference, resolution, and duration validations."""
+        if (
+            self.compression_quality == "lossless"
+            and self.output_codec == "h264"
+        ):
+            raise ValueError(
+                "Lossless compressionQuality requires output_codec 'prores' or"
+                " 'dnxhr'."
+            )
+
         if self.reference_images:
             seen_imgs: set[tuple[int, str]] = set()
             deduped_imgs: list[ReferenceImageDto] = []
@@ -294,8 +339,12 @@ class CreateVeoDto(BaseDto):
 
         conflicting_roles_present = False
         start_frame_role_present = False
+        end_frame_role_present = False
         reference_roles_present = False
+        image_reference_role_count = 0
         video_reference_role_count = 0
+        audio_reference_role_present = False
+        video_role_present = False
         model = self.generation_model
 
         if self.source_media_items:
@@ -303,11 +352,13 @@ class CreateVeoDto(BaseDto):
                 AssetRoleEnum.START_FRAME,
                 AssetRoleEnum.END_FRAME,
                 AssetRoleEnum.VIDEO_EXTENSION_SOURCE,
+                AssetRoleEnum.EDIT_SOURCE,
             }
             reference_roles = {
                 AssetRoleEnum.IMAGE_REFERENCE_ASSET,
                 AssetRoleEnum.IMAGE_REFERENCE_STYLE,
                 AssetRoleEnum.VIDEO_REFERENCE,
+                AssetRoleEnum.AUDIO_REFERENCE,
             }
             valid_roles = non_reference_roles.union(reference_roles)
 
@@ -318,32 +369,160 @@ class CreateVeoDto(BaseDto):
                     )
                 if item.role == AssetRoleEnum.START_FRAME:
                     start_frame_role_present = True
-                elif item.role in non_reference_roles:
+                elif item.role in {
+                    AssetRoleEnum.END_FRAME,
+                    AssetRoleEnum.VIDEO_EXTENSION_SOURCE,
+                }:
                     conflicting_roles_present = True
+                if item.role == AssetRoleEnum.END_FRAME:
+                    end_frame_role_present = True
                 if item.role in reference_roles:
                     reference_roles_present = True
+                if item.role in {
+                    AssetRoleEnum.IMAGE_REFERENCE_ASSET,
+                    AssetRoleEnum.IMAGE_REFERENCE_STYLE,
+                }:
+                    image_reference_role_count += 1
                 if item.role == AssetRoleEnum.VIDEO_REFERENCE:
                     video_reference_role_count += 1
+                if item.role == AssetRoleEnum.AUDIO_REFERENCE:
+                    audio_reference_role_present = True
+                if item.role in {
+                    AssetRoleEnum.VIDEO_EXTENSION_SOURCE,
+                    AssetRoleEnum.VIDEO_REFERENCE,
+                    AssetRoleEnum.EDIT_SOURCE,
+                }:
+                    video_role_present = True
 
         start_image_present = bool(self.start_image_asset_id)
         end_image_present = bool(self.end_image_asset_id)
         source_video_present = bool(self.source_video_asset_id)
+        total_ref_images = (
+            len(self.reference_images) if self.reference_images else 0
+        ) + image_reference_role_count
+        has_audio_ref = bool(
+            self.reference_audio or audio_reference_role_present
+        )
+
+        if model == GenerationModelEnum.VEO_EXP_PERF_ESTIMATION:
+            has_video = bool(
+                self.edit_source
+                or source_video_present
+                or self.reference_video
+                or video_role_present
+            )
+            if not has_video:
+                raise ValueError(
+                    "Performance estimation requires an input video"
+                    " (edit_source or video source_media_items).",
+                )
+            if self.duration_seconds and self.duration_seconds > 10:
+                raise ValueError(
+                    "Performance estimation supports up to 10 seconds, got"
+                    f" {self.duration_seconds}.",
+                )
+            return self
+
+        if model == GenerationModelEnum.OMNI_PERF:
+            if not self.prompt or not self.prompt.strip():
+                raise ValueError("Omni-Perf requires a non-empty prompt.")
+            if total_ref_images < 1 or total_ref_images > 5:
+                raise ValueError(
+                    "Omni-Perf requires between 1 and 5 reference images, got"
+                    f" {total_ref_images}.",
+                )
+            has_driving_video = bool(
+                self.reference_video
+                or self.reference_videos
+                or self.edit_source
+                or source_video_present
+                or video_role_present
+            )
+            if not has_driving_video:
+                raise ValueError(
+                    "Omni-Perf requires a driving performance video."
+                )
+            if self.duration_seconds and self.duration_seconds > 10:
+                raise ValueError(
+                    "Omni-Perf supports up to 10 seconds, got"
+                    f" {self.duration_seconds}.",
+                )
+            if self.audio_control_mode == "target_audio" and not has_audio_ref:
+                raise ValueError(
+                    "Omni-Perf audio_control_mode 'target_audio' requires"
+                    " reference_audio.",
+                )
+            return self
+
+        if model == GenerationModelEnum.OMNI_CINE:
+            if not self.prompt or not self.prompt.strip():
+                raise ValueError("Omni-Cine requires a non-empty prompt.")
+            if total_ref_images > 7:
+                raise ValueError(
+                    "Omni-Cine supports at most 7 reference images, got"
+                    f" {total_ref_images}.",
+                )
+            if self.duration_seconds and self.duration_seconds > 10:
+                raise ValueError(
+                    "Omni-Cine supports up to 10 seconds, got"
+                    f" {self.duration_seconds}.",
+                )
+            has_start = bool(start_image_present or start_frame_role_present)
+            has_end = bool(end_image_present or end_frame_role_present)
+            if has_end and not has_start:
+                raise ValueError(
+                    "Omni-Cine lastFrame (end_image_asset_id) requires image"
+                    " (start_image_asset_id).",
+                )
+            if (
+                self.audio_control_mode in ("target_audio", "reference_audio")
+                and not has_audio_ref
+            ):
+                raise ValueError(
+                    f"Omni-Cine audio_control_mode '{self.audio_control_mode}'"
+                    " requires reference_audio.",
+                )
+            return self
+
+        if model == GenerationModelEnum.VEO_EXP_VIDEO_TEXTURES:
+            if not (
+                self.seamless_loop
+                or self.tessellate_horizontal
+                or self.tessellate_vertical
+            ):
+                raise ValueError(
+                    "Video textures requires at least one of seamless_loop,"
+                    " tessellate_horizontal, or tessellate_vertical to be True."
+                )
+            has_any_image = bool(
+                start_image_present
+                or end_image_present
+                or start_frame_role_present
+                or end_frame_role_present
+            )
+            if self.seamless_loop and has_any_image:
+                raise ValueError(
+                    "Simultaneous looping and image conditioning is not"
+                    " supported",
+                )
+            if (not self.prompt or not self.prompt.strip()) and not (
+                start_image_present or start_frame_role_present
+            ):
+                raise ValueError(
+                    "Video textures requires a prompt or a conditioning image."
+                )
+            if self.duration_seconds and self.duration_seconds > 8:
+                raise ValueError(
+                    "Video textures supports up to 8 seconds, got"
+                    f" {self.duration_seconds}.",
+                )
+            return self
 
         if model == GenerationModelEnum.VEO_EXP_VIDEO_TRANSFORM:
             has_source_video = bool(
                 source_video_present
                 or self.edit_source
-                or (
-                    self.source_media_items
-                    and any(
-                        item.role
-                        in {
-                            AssetRoleEnum.VIDEO_EXTENSION_SOURCE,
-                            AssetRoleEnum.START_FRAME,
-                        }
-                        for item in self.source_media_items
-                    )
-                )
+                or video_role_present
                 or start_image_present
                 or start_frame_role_present
             )
@@ -662,6 +841,10 @@ class CreateVeoDto(BaseDto):
             GenerationModelEnum.VEO_3_QUALITY_PREVIEW,
             GenerationModelEnum.VEO_EXP_A2V_GENERATION,
             GenerationModelEnum.VEO_EXP_VIDEO_TRANSFORM,
+            GenerationModelEnum.VEO_EXP_PERF_ESTIMATION,
+            GenerationModelEnum.OMNI_PERF,
+            GenerationModelEnum.OMNI_CINE,
+            GenerationModelEnum.VEO_EXP_VIDEO_TEXTURES,
         ]
         if value not in valid_video_models:
             raise ValueError("Invalid generation model for video.")

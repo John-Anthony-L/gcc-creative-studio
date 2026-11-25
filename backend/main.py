@@ -54,6 +54,7 @@ from src.source_assets.source_asset_controller import (
 from src.tags.tags_controller import router as tags_router
 from src.users.user_controller import router as user_router
 from src.videos.veo_controller import router as video_router
+from src.videos.vpe_controller import config_router as vpe_config_router
 from src.videos.vpe_controller import router as vpe_router
 from src.workbench.router import router as workbench_router
 from src.workflows.workflow_controller import router as workflow_router
@@ -195,9 +196,9 @@ app.include_router(admin_router)
 app.include_router(audio_router)
 app.include_router(video_router)
 app.include_router(gallery_stream_router)
-# Mounted unconditionally. Its own dependency answers 503 when VPE is off,
-# which keeps the "is this deployment allowlisted?" decision in one place
-# instead of splitting it between here and there.
+# Mounted unconditionally. vpe_config_router exposes deployment capability
+# discovery while vpe_router answers 503 when VPE is off.
+app.include_router(vpe_config_router)
 app.include_router(vpe_router)
 app.include_router(gallery_router)
 app.include_router(gemini_router)

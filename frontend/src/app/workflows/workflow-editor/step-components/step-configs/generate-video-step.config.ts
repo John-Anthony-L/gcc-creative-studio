@@ -37,6 +37,7 @@ export const WORKFLOW_VIDEO_MODES: GenerationMode[] = [
 const model_options = MODEL_CONFIGS.filter(
   model =>
     model.type === 'VIDEO' &&
+    !model.capabilities.requiresVpe &&
     !model.value.startsWith('veo-exp-') &&
     model.capabilities.supportedModes.some(mode =>
       WORKFLOW_VIDEO_MODES.includes(mode),

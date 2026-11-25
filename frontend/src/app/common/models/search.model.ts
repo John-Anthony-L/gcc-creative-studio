@@ -119,6 +119,18 @@ export type VeoRequest = {
   seed?: number;
   videoTransformMaskAssetId?: AssetReferenceDto | null;
   conditioningFrames?: ConditioningFrameDto[] | null;
+  outputCodec?: 'h264' | 'prores' | 'dnxhr';
+  compressionQuality?: 'optimized' | 'lossless';
+  audioControlMode?:
+    | 'generate'
+    | 'preserve_video_audio'
+    | 'target_audio'
+    | 'reference_audio'
+    | null;
+  isBlueMeshInput?: boolean;
+  seamlessLoop?: boolean;
+  tessellateHorizontal?: boolean;
+  tessellateVertical?: boolean;
 };
 
 export type SearchResponse = {

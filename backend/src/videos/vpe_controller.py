@@ -20,6 +20,8 @@ gate is a dependency on the router itself, so a route added later cannot
 forget it.
 """
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi import status as Status
 
@@ -29,7 +31,7 @@ from src.galleries.dto.gallery_response_dto import MediaItemResponse
 from src.users.user_model import UserModel, UserRoleEnum
 from src.videos.dto.upscale_video_dto import UpscaleVideoDto
 from src.videos.dto.vpe_screening_dto import VpeScreeningResponse
-from src.videos.vpe.capabilities import VpeCapabilityId
+from src.videos.vpe.capabilities import VPE_CAPABILITY_LIST, VpeCapabilityId
 from src.videos.vpe_service import VpeService
 from src.workspaces.workspace_auth_guard import WorkspaceAuth
 
@@ -49,6 +51,30 @@ def require_vpe_enabled() -> None:
             status_code=Status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="VPE is not enabled on this deployment.",
         )
+
+
+config_router = APIRouter(
+    prefix="/api/videos/vpe",
+    tags=["Veo Pro Experimental"],
+    dependencies=[user_only],
+)
+
+
+@config_router.get(
+    "/config",
+    summary="Return VPE availability and capabilities for this deployment",
+)
+async def get_vpe_config() -> dict[str, Any]:
+    """Reports whether VPE/GMP is enabled and which capabilities are supported."""
+    enabled = bool(config_service.VPE_ENABLED)
+    return {
+        "enabled": enabled,
+        "capabilities": (
+            [c.capability_id.value for c in VPE_CAPABILITY_LIST]
+            if enabled
+            else []
+        ),
+    }
 
 
 router = APIRouter(

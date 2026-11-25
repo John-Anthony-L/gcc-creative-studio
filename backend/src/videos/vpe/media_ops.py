@@ -420,6 +420,114 @@ def postprocess_dialogue_video(
     return Path(target)
 
 
+def transcode_to_h264_preview(
+    input_path: Path | str,
+    output_path: Path | str,
+) -> Path:
+    """Transcodes a ProRes (.mov) or DNxHR (.mxf) master to a web H.264 MP4.
+
+    Args:
+        input_path: Local path to the GMP master video (.mov or .mxf).
+        output_path: Local path for the web-playable H.264 MP4 preview.
+
+    Returns:
+        The written ``output_path`` as a Path.
+    """
+    _ffmpeg(
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        "-c:a",
+        "aac",
+        str(output_path),
+    )
+    return Path(output_path)
+
+
+def normalize_video_720p_24fps(
+    input_path: Path | str,
+    output_path: Path | str,
+    max_frames: int = 240,
+) -> Path:
+    """Normalizes an arbitrary video to 1280x720 @ 24fps H.264 MP4.
+
+    Scales and pads with letterbox/pillarbox to preserve aspect ratio, locks
+    frame rate to constant 24 fps, and caps duration to ``max_frames``.
+
+    Args:
+        input_path: Source video path.
+        output_path: Destination MP4 path.
+        max_frames: Maximum number of frames at 24 fps (default 240 = 10s).
+
+    Returns:
+        The written ``output_path`` as a Path.
+    """
+    max_seconds = max_frames / 24.0
+    filter_str = (
+        "fps=24,scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(1280-iw)/2:(720-ih)/2:black,setsar=1"
+    )
+    _ffmpeg(
+        "-i",
+        str(input_path),
+        "-t",
+        f"{max_seconds:.3f}",
+        "-vf",
+        filter_str,
+        "-frames:v",
+        str(max_frames),
+        "-fps_mode",
+        "cfr",
+        "-r",
+        "24",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        "-c:a",
+        "aac",
+        str(output_path),
+    )
+    return Path(output_path)
+
+
+def extract_audio_wav(
+    video_source: Path | str,
+    target: Path | str,
+) -> Path | None:
+    """Extracts 48kHz stereo WAV audio from a video if it has an audio track.
+
+    Args:
+        video_source: Video file to extract audio from.
+        target: Destination .wav path.
+
+    Returns:
+        The written ``target`` Path, or None if the video has no audio stream.
+    """
+    if not has_audio_stream(video_source):
+        return None
+    _ffmpeg(
+        "-i",
+        str(video_source),
+        "-vn",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-c:a",
+        "pcm_s16le",
+        str(target),
+    )
+    return Path(target)
+
+
 def prepare_transform_video(
     video_source: Path | str,
     target: Path | str,

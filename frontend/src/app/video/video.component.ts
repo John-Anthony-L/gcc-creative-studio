@@ -76,6 +76,7 @@ import {
 } from '../services/video-state.service';
 import {WorkspaceStateService} from '../services/workspace/workspace-state.service';
 import {GalleryService} from '../gallery/gallery.service';
+import {VpeService} from '../services/vpe/vpe.service';
 
 import {
   handleErrorSnackbar,
@@ -135,6 +136,18 @@ export class VideoComponent implements OnInit, AfterViewInit {
   transformStrength = 0.5;
   seed: number | null = null;
   numDiffusionSteps = 20;
+  outputCodec: 'h264' | 'prores' | 'dnxhr' = 'h264';
+  compressionQuality: 'optimized' | 'lossless' = 'optimized';
+  audioControlMode:
+    | 'generate'
+    | 'preserve_video_audio'
+    | 'target_audio'
+    | 'reference_audio'
+    | null = null;
+  isBlueMeshInput = false;
+  seamlessLoop = true;
+  tessellateHorizontal = false;
+  tessellateVertical = false;
   currentMode = 'Text to Video';
   modes = [
     {value: 'Text to Video', icon: 'description', label: 'Text to Video'},
@@ -244,12 +257,15 @@ export class VideoComponent implements OnInit, AfterViewInit {
     private workspaceStateService: WorkspaceStateService,
     private sourceAssetService: SourceAssetService,
     private videoStateService: VideoStateService,
+    private vpeService: VpeService,
 
     @Inject(GalleryService)
     private galleryService: GalleryService,
     @Inject(PLATFORM_ID) private platformId: Object,
   ) {
-    this.generationModels = MODEL_CONFIGS.filter(m => m.type === 'VIDEO');
+    this.generationModels = MODEL_CONFIGS.filter(
+      m => m.type === 'VIDEO' && !m.capabilities.requiresVpe,
+    );
     this.searchRequest.generationModel = DEFAULT_VIDEO_MODEL;
     this.selectedGenerationModel =
       this.generationModels.find(m => m.value === DEFAULT_VIDEO_MODEL)
@@ -264,22 +280,23 @@ export class VideoComponent implements OnInit, AfterViewInit {
       ),
     );
 
+    const iconPath = 'assets/images';
     this.matIconRegistry
       .addSvgIcon(
         'content-type-icon',
-        this.setPath(`${this.path}/content-type-icon.svg`),
+        this.setPath(`${iconPath}/content-type-icon.svg`),
       )
       .addSvgIcon(
         'lighting-icon',
-        this.setPath(`${this.path}/lighting-icon.svg`),
+        this.setPath(`${iconPath}/lighting-icon.svg`),
       )
       .addSvgIcon(
         'number-of-images-icon',
-        this.setPath(`${this.path}/number-of-images-icon.svg`),
+        this.setPath(`${iconPath}/number-of-images-icon.svg`),
       )
       .addSvgIcon(
         'gemini-spark-icon',
-        this.setPath(`${this.path}/gemini-spark-icon.svg`),
+        this.setPath(`${iconPath}/gemini-spark-icon.svg`),
       );
 
     const navigation = this.router.getCurrentNavigation();
@@ -308,6 +325,11 @@ export class VideoComponent implements OnInit, AfterViewInit {
   }
 
   ngOnInit(): void {
+    const persistedModel = this.videoStateService.getState().model;
+    const persistedRequiresVpe = !!MODEL_CONFIGS.find(
+      m => m.type === 'VIDEO' && m.value === persistedModel,
+    )?.capabilities.requiresVpe;
+
     this.restoreState();
     if (this.pendingRemixState) {
       this.applyRemixState(this.pendingRemixState);
@@ -315,6 +337,49 @@ export class VideoComponent implements OnInit, AfterViewInit {
     if (this.pendingSourceAssets) {
       this.applySourceAssets(this.pendingSourceAssets);
     }
+
+    this.vpeService.loadConfig().subscribe(cfg => {
+      if (cfg.enabled) {
+        this.generationModels = MODEL_CONFIGS.filter(m => m.type === 'VIDEO');
+        if (
+          persistedRequiresVpe &&
+          !this.pendingRemixState &&
+          !this.pendingSourceAssets
+        ) {
+          this.restoreState();
+        } else if (this.pendingRemixState?.generationModel) {
+          const remixModel = this.generationModels.find(
+            m =>
+              m.value === this.pendingRemixState.generationModel ||
+              m.value.startsWith(this.pendingRemixState.generationModel),
+          );
+          if (remixModel?.capabilities.requiresVpe) {
+            this.selectModel(remixModel);
+          }
+        }
+      } else {
+        this.generationModels = MODEL_CONFIGS.filter(
+          m => m.type === 'VIDEO' && !m.capabilities.requiresVpe,
+        );
+        const activeConfig = MODEL_CONFIGS.find(
+          m =>
+            m.type === 'VIDEO' &&
+            m.value === this.searchRequest.generationModel,
+        );
+        if (activeConfig?.capabilities.requiresVpe) {
+          const defaultModel =
+            this.generationModels.find(m => m.value === DEFAULT_VIDEO_MODEL) ||
+            this.generationModels[0];
+          if (defaultModel) {
+            this.selectModel(defaultModel);
+          } else {
+            this.searchRequest.generationModel = DEFAULT_VIDEO_MODEL;
+          }
+        } else if (persistedRequiresVpe) {
+          this.saveState();
+        }
+      }
+    });
   }
 
   public saveState() {
@@ -345,6 +410,13 @@ export class VideoComponent implements OnInit, AfterViewInit {
       transformStrength: this.transformStrength,
       seed: this.seed,
       numDiffusionSteps: this.numDiffusionSteps,
+      outputCodec: this.outputCodec,
+      compressionQuality: this.compressionQuality,
+      audioControlMode: this.audioControlMode,
+      isBlueMeshInput: this.isBlueMeshInput,
+      seamlessLoop: this.seamlessLoop,
+      tessellateHorizontal: this.tessellateHorizontal,
+      tessellateVertical: this.tessellateVertical,
     });
   }
 
@@ -386,6 +458,13 @@ export class VideoComponent implements OnInit, AfterViewInit {
     this.transformStrength = state.transformStrength ?? 0.5;
     this.seed = state.seed ?? null;
     this.numDiffusionSteps = state.numDiffusionSteps ?? 20;
+    this.outputCodec = state.outputCodec ?? 'h264';
+    this.compressionQuality = state.compressionQuality ?? 'optimized';
+    this.audioControlMode = state.audioControlMode ?? null;
+    this.isBlueMeshInput = state.isBlueMeshInput ?? false;
+    this.seamlessLoop = state.seamlessLoop ?? true;
+    this.tessellateHorizontal = state.tessellateHorizontal ?? false;
+    this.tessellateVertical = state.tessellateVertical ?? false;
 
     this.negativePhrases = state.negativePrompt
       ? state.negativePrompt.split(', ').filter(Boolean)
@@ -404,7 +483,9 @@ export class VideoComponent implements OnInit, AfterViewInit {
     if (modelOption) {
       this.selectedGenerationModel = modelOption.viewValue;
     } else if (this.generationModels.length) {
-      const fallbackModel = this.generationModels[0];
+      const fallbackModel =
+        this.generationModels.find(m => m.value === DEFAULT_VIDEO_MODEL) ||
+        this.generationModels[0];
       this.searchRequest.generationModel = fallbackModel.value;
       this.selectedGenerationModel = fallbackModel.viewValue;
     }
@@ -465,8 +546,6 @@ export class VideoComponent implements OnInit, AfterViewInit {
     }
   }
 
-  private path = '../../assets/images';
-
   private setPath(url: string): SafeResourceUrl {
     return this.sanitizer.bypassSecurityTrustResourceUrl(url);
   }
@@ -526,6 +605,12 @@ export class VideoComponent implements OnInit, AfterViewInit {
     }
     if (!capabilities.supportsConditioningFrames) {
       this.conditioningKeyframes = [];
+    }
+    if (
+      model.value !== 'omni-cine' &&
+      this.audioControlMode === 'reference_audio'
+    ) {
+      this.audioControlMode = 'generate';
     }
     const maxVideoRefs =
       capabilities.maxReferenceVideos ??
@@ -897,7 +982,15 @@ export class VideoComponent implements OnInit, AfterViewInit {
         });
       return;
     }
-    if (!this.searchRequest.prompt && !this.isExtensionMode) {
+    if (this.searchRequest.generationModel === 'veo-exp-perf-estimation') {
+      if (!this.editSource) {
+        handleInfoSnackbar(
+          this._snackBar,
+          'Please select or upload a source video for 2D Performance Estimation.',
+        );
+        return;
+      }
+    } else if (!this.searchRequest.prompt && !this.isExtensionMode) {
       handleInfoSnackbar(
         this._snackBar,
         'Please enter a prompt to generate a video.',
@@ -969,6 +1062,10 @@ export class VideoComponent implements OnInit, AfterViewInit {
     this.isLoading = true;
     this.videoDocuments = null;
 
+    const capabilities = this.getModelCapabilities();
+    const suppressFramesForSeamlessLoop =
+      !!capabilities.supportsSeamlessLoop && this.seamlessLoop;
+
     const validSourceMediaItems = this.sourceMediaItems.filter(
       (i): i is SourceMediaItemLink => !!i,
     );
@@ -985,11 +1082,12 @@ export class VideoComponent implements OnInit, AfterViewInit {
       this.currentMode === 'Ingredients to Video' ||
       this.currentMode === 'Edit Video' ||
       (this.currentMode === 'Frames to Video' &&
-        !!this.getModelCapabilities().supportsFrameWithReferences);
+        !!capabilities.supportsFrameWithReferences);
 
-    // Frames to Video always carries its frame slots, whether or not the model
-    // also accepts references alongside them.
-    const carriesFrameSlots = this.currentMode === 'Frames to Video';
+    // Frames to Video always carries its frame slots (unless suppressed by
+    // seamless temporal loop on texture models).
+    const carriesFrameSlots =
+      this.currentMode === 'Frames to Video' && !suppressFramesForSeamlessLoop;
 
     // --- Build the two separate R2V reference payloads ---
     const referenceImagesPayload: {
@@ -1019,19 +1117,19 @@ export class VideoComponent implements OnInit, AfterViewInit {
     const payload: VeoRequest = {
       ...this.searchRequest,
       startImageAssetId:
-        this.currentMode === 'Frames to Video' &&
+        carriesFrameSlots &&
         !this._input1IsVideo &&
         this.startImageAssetId !== null
           ? {id: this.startImageAssetId, type: 'source_asset'}
           : undefined,
       sourceVideoAssetId:
-        ((this.currentMode === 'Frames to Video' && this._input1IsVideo) ||
+        ((carriesFrameSlots && this._input1IsVideo) ||
           this.currentMode === 'Extend Video') &&
         this.startImageAssetId !== null
           ? {id: this.startImageAssetId, type: 'source_asset'}
           : undefined,
       endImageAssetId:
-        this.currentMode === 'Frames to Video' && this.endImageAssetId !== null
+        carriesFrameSlots && this.endImageAssetId !== null
           ? {id: this.endImageAssetId, type: 'source_asset'}
           : undefined,
       referenceImages:
@@ -1067,7 +1165,10 @@ export class VideoComponent implements OnInit, AfterViewInit {
           : undefined,
       referenceAudio:
         (this.currentMode === 'Ingredients to Video' ||
-          this.currentMode === 'Frames to Video') &&
+          this.currentMode === 'Frames to Video' ||
+          (!!capabilities.supportsAudioReference &&
+            (this.currentMode === 'Edit Video' ||
+              this.currentMode === 'Text to Video'))) &&
         this.referenceAudio
           ? {
               id: this.referenceAudio.id,
@@ -1088,22 +1189,16 @@ export class VideoComponent implements OnInit, AfterViewInit {
               index: this.editSource.index,
             }
           : undefined,
-      videoTransformStrength:
-        this.searchRequest.generationModel === 'veo-exp-video-transform'
-          ? this.transformStrength
-          : undefined,
-      numDiffusionSteps:
-        this.searchRequest.generationModel === 'veo-exp-video-transform'
-          ? this.numDiffusionSteps
-          : undefined,
+      videoTransformStrength: capabilities.supportsTransformStrength
+        ? this.transformStrength
+        : undefined,
+      numDiffusionSteps: capabilities.supportsDiffusionSteps
+        ? this.numDiffusionSteps
+        : undefined,
       seed:
-        this.searchRequest.generationModel === 'veo-exp-video-transform' &&
-        this.seed !== null
-          ? this.seed
-          : undefined,
+        capabilities.supportsSeed && this.seed !== null ? this.seed : undefined,
       videoTransformMaskAssetId:
-        this.searchRequest.generationModel === 'veo-exp-video-transform' &&
-        this.maskSource
+        capabilities.supportsMask && this.maskSource
           ? {
               id: this.maskSource.id,
               type: this.maskSource.type,
@@ -1111,13 +1206,35 @@ export class VideoComponent implements OnInit, AfterViewInit {
             }
           : undefined,
       conditioningFrames:
-        this.searchRequest.generationModel === 'veo-exp-video-transform' &&
+        capabilities.supportsConditioningFrames &&
         this.conditioningKeyframes.length > 0
           ? this.conditioningKeyframes.map(cf => ({
               frame_number: cf.frameNumber,
               image_asset_id: cf.assetId,
             }))
           : undefined,
+      outputCodec: capabilities.supportsProFormats
+        ? this.outputCodec
+        : undefined,
+      compressionQuality: capabilities.supportsProFormats
+        ? this.compressionQuality
+        : undefined,
+      audioControlMode:
+        capabilities.supportsAudioControlMode && this.audioControlMode
+          ? this.audioControlMode
+          : undefined,
+      isBlueMeshInput: capabilities.supportsPerformanceControl
+        ? this.isBlueMeshInput
+        : undefined,
+      seamlessLoop: capabilities.supportsSeamlessLoop
+        ? this.seamlessLoop
+        : undefined,
+      tessellateHorizontal: capabilities.supportsSeamlessLoop
+        ? this.tessellateHorizontal
+        : undefined,
+      tessellateVertical: capabilities.supportsSeamlessLoop
+        ? this.tessellateVertical
+        : undefined,
     };
 
     // TODO: Add notification when video is completed after the pooling
@@ -2082,6 +2199,48 @@ export class VideoComponent implements OnInit, AfterViewInit {
 
   onNumDiffusionStepsChanged(value: number): void {
     this.numDiffusionSteps = value;
+    this.saveState();
+  }
+
+  onOutputCodecChanged(value: 'h264' | 'prores' | 'dnxhr'): void {
+    this.outputCodec = value;
+    this.saveState();
+  }
+
+  onCompressionQualityChanged(value: 'optimized' | 'lossless'): void {
+    this.compressionQuality = value;
+    this.saveState();
+  }
+
+  onAudioControlModeChanged(
+    value:
+      | 'generate'
+      | 'preserve_video_audio'
+      | 'target_audio'
+      | 'reference_audio'
+      | null,
+  ): void {
+    this.audioControlMode = value;
+    this.saveState();
+  }
+
+  onIsBlueMeshInputChanged(value: boolean): void {
+    this.isBlueMeshInput = value;
+    this.saveState();
+  }
+
+  onSeamlessLoopChanged(value: boolean): void {
+    this.seamlessLoop = value;
+    this.saveState();
+  }
+
+  onTessellateHorizontalChanged(value: boolean): void {
+    this.tessellateHorizontal = value;
+    this.saveState();
+  }
+
+  onTessellateVerticalChanged(value: boolean): void {
+    this.tessellateVertical = value;
     this.saveState();
   }
 

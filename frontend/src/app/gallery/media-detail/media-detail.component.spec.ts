@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import {NO_ERRORS_SCHEMA} from '@angular/core';
+import {NO_ERRORS_SCHEMA, signal} from '@angular/core';
 import {ComponentFixture, TestBed} from '@angular/core/testing';
 import {MatDialog} from '@angular/material/dialog';
 import {MatSnackBar} from '@angular/material/snack-bar';
@@ -99,7 +99,11 @@ describe('MediaDetailComponent', () => {
       'getMedia',
       'getAsset',
     ]);
-    vpeService = jasmine.createSpyObj('VpeService', ['screenForUpscale']);
+    vpeService = jasmine.createSpyObj(
+      'VpeService',
+      ['loadConfig', 'screenForUpscale'],
+      {vpeEnabled: signal(true), vpeConfigLoaded: signal(true)},
+    );
     workspaceState = jasmine.createSpyObj('WorkspaceStateService', [
       'getActiveWorkspaceId',
     ]);
@@ -110,6 +114,9 @@ describe('MediaDetailComponent', () => {
 
     authService.isUserAdmin.and.returnValue(false);
     galleryService.getMedia.and.returnValue(of(item()));
+    vpeService.loadConfig.and.returnValue(
+      of({enabled: true, capabilities: ['video_upscale']}),
+    );
     vpeService.screenForUpscale.and.returnValue(of(screening));
     workspaceState.getActiveWorkspaceId.and.returnValue(1);
     dialog.open.and.returnValue({
@@ -127,8 +134,20 @@ describe('MediaDetailComponent', () => {
     it('screens a stored video once it has loaded', () => {
       build();
 
+      expect(vpeService.loadConfig).toHaveBeenCalled();
       expect(vpeService.screenForUpscale).toHaveBeenCalledWith(ITEM_ID);
       expect(component.vpeScreening).toEqual(screening);
+    });
+
+    it('skips screening when VPE is disabled on the backend', () => {
+      vpeService.loadConfig.and.returnValue(
+        of({enabled: false, capabilities: []}),
+      );
+
+      build();
+
+      expect(vpeService.screenForUpscale).not.toHaveBeenCalled();
+      expect(component.vpeScreening).toBeUndefined();
     });
 
     it('does not screen an image', () => {

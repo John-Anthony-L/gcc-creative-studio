@@ -50,6 +50,9 @@ class VpeScreeningResponse(BaseModel):
         ),
     )
     findings: list[VpeFindingResponse] = []
+    supported_modes: list[str] = Field(
+        default_factory=lambda: ["1080p", "4k", "4k_pro", "8k"],
+    )
 
     @classmethod
     def from_result(
@@ -79,4 +82,5 @@ class VpeScreeningResponse(BaseModel):
                 )
                 for finding in result.findings
             ],
+            supported_modes=list(result.supported_modes),
         )
